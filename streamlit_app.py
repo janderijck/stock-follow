@@ -10,23 +10,24 @@ DB_PATH = Path("data.db")
 def get_connection():
     """Maakt (of opent) de SQLite database en zorgt dat de tabel bestaat."""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    conn.executescript(
         """
 CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
-    broker TEXT NOT NULL,           -- NIEUW: welke broker
-    transaction_type TEXT NOT NULL, -- NIEUW: 'BUY' of 'SELL'
+    broker TEXT NOT NULL,
+    transaction_type TEXT NOT NULL,
     name TEXT NOT NULL,
     ticker TEXT NOT NULL,
     isin TEXT NOT NULL,
-    quantity INTEGER NOT NULL,      -- NIEUW: aantal aandelen
+    quantity INTEGER NOT NULL,
     price_per_share REAL NOT NULL,
-    currency TEXT NOT NULL,         -- NIEUW: EUR, USD, etc.
+    currency TEXT NOT NULL,
     fees REAL NOT NULL,
-    exchange_rate REAL DEFAULT 1.0, -- NIEUW: wisselkoers naar EUR
+    exchange_rate REAL DEFAULT 1.0,
     notes TEXT
-)
+);
+
 CREATE TABLE IF NOT EXISTS cash_balance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     broker TEXT NOT NULL,
@@ -34,21 +35,21 @@ CREATE TABLE IF NOT EXISTS cash_balance (
     amount REAL NOT NULL,
     last_updated TEXT NOT NULL,
     UNIQUE(broker, currency)
-        )
+);
         """
     )
     return conn
 
 
-def insert_transaction(date, name, ticker, isin, price, fees):
+def insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate=1.0, notes=""):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO transactions (date, name, ticker, isin, price, fees)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (date.isoformat(), name, ticker.upper(), isin.upper(), float(price), float(fees)),
+        (date.isoformat(), broker, transaction_type, name, ticker.upper(), isin.upper(), int(quantity), float(price_per_share), currency, float(fees), float(exchange_rate), notes),
     )
     conn.commit()
     conn.close()
@@ -57,9 +58,11 @@ def insert_transaction(date, name, ticker, isin, price, fees):
 def load_transactions():
     conn = get_connection()
     df = pd.read_sql_query(
-        "SELECT date AS Datum, name AS Aandeel, ticker AS Ticker, "
-        "isin AS ISIN, price AS Prijs, fees AS Kosten "
-        "FROM transactions ORDER BY date",
+        "SELECT date AS Datum, broker AS Broker, transaction_type AS Type, "
+        "name AS Aandeel, ticker AS Ticker, isin AS ISIN, "
+        "quantity AS Aantal, price_per_share AS 'Prijs/stuk', currency AS Valuta, "
+        "fees AS Kosten, exchange_rate AS Wisselkoers, notes AS Notities "
+        "FROM transactions ORDER BY date DESC",
         conn,
     )
     conn.close()
@@ -70,36 +73,50 @@ st.set_page_config(page_title="Portfolio tracker", page_icon="📈")
 st.title("Transactie invoeren")
 
 with st.form("new_transaction"):
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        date = st.date_input("Koopdatum")
+        date = st.date_input("Datum")
+        broker = st.text_input("Broker (bv. DEGIRO)")
+        transaction_type = st.selectbox("Type", ["BUY", "SELL"])
         name = st.text_input("Naam aandeel")
-        ticker = st.text_input("Ticker (bv. AAPL)")
 
     with col2:
+        ticker = st.text_input("Ticker (bv. AAPL)")
         isin = st.text_input("ISIN")
-        price = st.number_input(
-            "Prijs per stuk",
+        quantity = st.number_input("Aantal aandelen", min_value=1, step=1)
+        price_per_share = st.number_input(
+            "Prijs per aandeel",
             min_value=0.0,
             step=0.01,
             format="%.2f",
         )
+
+    with col3:
+        currency = st.selectbox("Valuta", ["EUR", "USD", "GBP"])
         fees = st.number_input(
             "Kosten (broker + taksen)",
             min_value=0.0,
             step=0.01,
             format="%.2f",
         )
+        exchange_rate = st.number_input(
+            "Wisselkoers naar EUR",
+            min_value=0.0,
+            value=1.0,
+            step=0.01,
+            format="%.4f",
+        )
+        notes = st.text_area("Notities (optioneel)", height=100)
 
     submitted = st.form_submit_button("Opslaan")
 
 
 if submitted:
-    if not (name and ticker and isin):
-        st.error("Vul minstens naam, ticker en ISIN in.")
+    if not (broker and name and ticker and isin and quantity > 0):
+        st.error("Vul alle verplichte velden in.")
     else:
-        insert_transaction(date, name, ticker, isin, price, fees)
+        insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
         st.success("Transactie opgeslagen.")
 
 
