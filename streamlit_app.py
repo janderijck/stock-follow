@@ -7,6 +7,67 @@ DB_PATH = Path("data.db")
 
 
 # --------- Database helpers ---------
+def migrate_database():
+    """Migreert oude database schema naar nieuwe versie."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Check of transactions tabel bestaat en welke kolommen het heeft
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
+    table_exists = cursor.fetchone() is not None
+
+    if table_exists:
+        # Check of broker kolom bestaat (nieuwe schema)
+        cursor.execute("PRAGMA table_info(transactions)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if 'broker' not in columns:
+            # Oude schema detecteerd - migreer data
+            print("Migrating database to new schema...")
+
+            # Backup oude data
+            cursor.execute("SELECT * FROM transactions")
+            old_data = cursor.fetchall()
+
+            # Drop oude tabel
+            cursor.execute("DROP TABLE transactions")
+
+            # Maak nieuwe tabel
+            cursor.executescript("""
+                CREATE TABLE transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    broker TEXT NOT NULL,
+                    transaction_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    isin TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    price_per_share REAL NOT NULL,
+                    currency TEXT NOT NULL,
+                    fees REAL NOT NULL,
+                    exchange_rate REAL DEFAULT 1.0,
+                    notes TEXT
+                );
+            """)
+
+            # Migreer oude data met default waarden voor nieuwe kolommen
+            for row in old_data:
+                # Oude schema: id, date, name, ticker, isin, price, fees
+                old_id, old_date, old_name, old_ticker, old_isin, old_price, old_fees = row
+                cursor.execute(
+                    """INSERT INTO transactions
+                    (date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (old_date, "UNKNOWN", "BUY", old_name, old_ticker, old_isin, 1, old_price, "EUR", old_fees, 1.0, "Gemigreerd van oude data")
+                )
+
+            conn.commit()
+            print(f"Migrated {len(old_data)} transactions to new schema")
+
+    conn.close()
+
+
 def get_connection():
     """Maakt (of opent) de SQLite database en zorgt dat de tabel bestaat."""
     conn = sqlite3.connect(DB_PATH)
@@ -70,6 +131,10 @@ def load_transactions():
 
 # --------- Streamlit UI ---------
 st.set_page_config(page_title="Portfolio tracker", page_icon="📈")
+
+# Migreer database bij startup
+migrate_database()
+
 st.title("Transactie invoeren")
 
 with st.form("new_transaction"):
