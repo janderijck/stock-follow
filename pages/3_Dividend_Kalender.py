@@ -23,6 +23,19 @@ def get_connection():
             updated_at TEXT NOT NULL
         )
     """)
+    # Zorg dat dividend cache tabel bestaat
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dividend_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            isin TEXT,
+            ex_date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(ticker, ex_date)
+        )
+    """)
+    conn.commit()
     return conn
 
 
@@ -180,6 +193,196 @@ def fetch_dividends_from_alphavantage(ticker):
         return {'error': f'Netwerk error: {str(e)}'}
     except Exception as e:
         return {'error': f'Onverwachte fout: {str(e)}'}
+
+
+def save_dividends_to_cache(ticker, isin, dividends):
+    """Slaat dividend data op in de cache buffer tabel."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    fetched_at = datetime.now().isoformat()
+    added_count = 0
+    updated_count = 0
+
+    for div in dividends:
+        try:
+            cursor.execute(
+                """
+                INSERT INTO dividend_cache (ticker, isin, ex_date, amount, fetched_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, ex_date)
+                DO UPDATE SET amount = ?, fetched_at = ?
+                """,
+                (ticker, isin, div['ex_date'], div['amount'], fetched_at, div['amount'], fetched_at)
+            )
+            if cursor.rowcount == 1:
+                added_count += 1
+            else:
+                updated_count += 1
+        except Exception as e:
+            st.error(f"Error opslaan dividend: {e}")
+
+    conn.commit()
+    conn.close()
+
+    return {'added': added_count, 'updated': updated_count}
+
+
+def get_cached_dividends(ticker=None):
+    """Haalt cached dividend data op voor een specifieke ticker of alle tickers."""
+    conn = get_connection()
+
+    if ticker:
+        query = """
+            SELECT ticker, isin, ex_date, amount, fetched_at
+            FROM dividend_cache
+            WHERE ticker = ?
+            ORDER BY ex_date DESC
+        """
+        df = pd.read_sql_query(query, conn, params=(ticker,))
+    else:
+        query = """
+            SELECT ticker, isin, ex_date, amount, fetched_at
+            FROM dividend_cache
+            ORDER BY ticker, ex_date DESC
+        """
+        df = pd.read_sql_query(query, conn)
+
+    conn.close()
+    return df
+
+
+def get_cache_last_updated(ticker):
+    """Haalt de laatste update timestamp op voor een ticker."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT MAX(fetched_at) FROM dividend_cache WHERE ticker = ?",
+        (ticker,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+
+    return result[0] if result and result[0] else None
+
+
+def clear_cache(ticker=None):
+    """Leegt de cache voor een specifieke ticker of alle tickers."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if ticker:
+        cursor.execute("DELETE FROM dividend_cache WHERE ticker = ?", (ticker,))
+    else:
+        cursor.execute("DELETE FROM dividend_cache")
+
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    return deleted
+
+
+def import_from_cache_to_db(ticker, ex_date):
+    """Importeert een specifieke dividend van cache naar de database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Haal dividend op uit cache
+    cursor.execute(
+        """
+        SELECT ticker, isin, ex_date, amount
+        FROM dividend_cache
+        WHERE ticker = ? AND ex_date = ?
+        """,
+        (ticker, ex_date)
+    )
+
+    cache_row = cursor.fetchone()
+
+    if not cache_row:
+        conn.close()
+        return {'success': False, 'error': 'Dividend niet gevonden in cache'}
+
+    ticker, isin, ex_date, amount = cache_row
+
+    # Check of deze dividend al bestaat in de database
+    cursor.execute(
+        "SELECT id FROM dividends WHERE ticker = ? AND ex_date = ?",
+        (ticker, ex_date)
+    )
+
+    if cursor.fetchone():
+        conn.close()
+        return {'success': False, 'error': 'Dividend bestaat al in database'}
+
+    # Insert nieuwe dividend
+    cursor.execute(
+        """
+        INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (ticker, isin, ex_date, amount, "Geïmporteerd van Alpha Vantage via cache")
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {'success': True}
+
+
+def import_all_from_cache_to_db(ticker):
+    """Importeert alle dividenden van een ticker van cache naar database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Haal alle cached dividenden op voor deze ticker
+    cursor.execute(
+        """
+        SELECT ticker, isin, ex_date, amount
+        FROM dividend_cache
+        WHERE ticker = ?
+        """,
+        (ticker,)
+    )
+
+    cache_rows = cursor.fetchall()
+
+    if not cache_rows:
+        conn.close()
+        return {'imported': 0, 'skipped': 0}
+
+    imported_count = 0
+    skipped_count = 0
+
+    for row in cache_rows:
+        ticker, isin, ex_date, amount = row
+
+        # Check of deze dividend al bestaat
+        cursor.execute(
+            "SELECT id FROM dividends WHERE ticker = ? AND ex_date = ?",
+            (ticker, ex_date)
+        )
+
+        if cursor.fetchone():
+            skipped_count += 1
+            continue
+
+        # Insert nieuwe dividend
+        cursor.execute(
+            """
+            INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (ticker, isin, ex_date, amount, "Geïmporteerd van Alpha Vantage via cache")
+        )
+        imported_count += 1
+
+    conn.commit()
+    conn.close()
+
+    return {'imported': imported_count, 'skipped': skipped_count}
 
 
 def import_dividend_to_db(ticker, isin, ex_date, amount):
@@ -406,7 +609,7 @@ with tab3:
 # Tab 4: Import Dividenden
 with tab4:
     st.subheader("⬇️ Dividend Geschiedenis Importeren")
-    st.info("📡 Importeer automatisch dividend geschiedenis van Alpha Vantage voor je portfolio aandelen.")
+    st.info("📡 Haal dividend data op van Alpha Vantage. De data wordt eerst in een buffer opgeslagen zodat je deze kan controleren voordat je importeert.")
 
     # Check of API key is ingesteld
     api_key = get_setting('alpha_vantage_api_key', '')
@@ -426,116 +629,145 @@ with tab4:
         else:
             st.write(f"**{len(portfolio_stocks)} aandelen gevonden in je portfolio**")
 
-            # Selecteer aandeel
-            selected_stock = st.selectbox(
-                "Selecteer aandeel om dividenden te importeren:",
-                options=portfolio_stocks,
-                format_func=lambda x: f"{x['name']} ({x['ticker']})"
-            )
+            # Stap 1: Ophalen van API data
+            st.write("### 📥 Stap 1: Data Ophalen van API")
 
+            col1, col2 = st.columns([3, 1])
+
+            with col1:
+                selected_stock = st.selectbox(
+                    "Selecteer aandeel om dividend data op te halen:",
+                    options=portfolio_stocks,
+                    format_func=lambda x: f"{x['name']} ({x['ticker']})"
+                )
+
+            with col2:
+                st.write("")  # Spacer
+                st.write("")  # Spacer
+                if st.button("🔄 Haal Data Op", type="primary", use_container_width=True):
+                    with st.spinner(f"Dividenden ophalen voor {selected_stock['ticker']}..."):
+                        result = fetch_dividends_from_alphavantage(selected_stock['ticker'])
+
+                        if 'error' in result:
+                            st.error(f"❌ {result['error']}")
+                        elif 'dividends' in result:
+                            dividends = result['dividends']
+
+                            if not dividends:
+                                st.info(f"Geen dividend geschiedenis gevonden voor {selected_stock['ticker']}")
+                            else:
+                                # Sla op in cache
+                                cache_result = save_dividends_to_cache(
+                                    selected_stock['ticker'],
+                                    selected_stock['isin'],
+                                    dividends
+                                )
+
+                                st.success(f"✓ {len(dividends)} dividenden opgehaald en opgeslagen in buffer!")
+                                st.info(f"ℹ️ Nieuw: {cache_result['added']}, Geüpdatet: {cache_result['updated']}")
+                                st.rerun()
+
+            # Toon laatste update per ticker
             if selected_stock:
-                col1, col2 = st.columns([2, 1])
+                last_updated = get_cache_last_updated(selected_stock['ticker'])
+                if last_updated:
+                    last_updated_dt = datetime.fromisoformat(last_updated)
+                    time_ago = datetime.now() - last_updated_dt
 
-                with col1:
-                    st.write(f"**Geselecteerd:** {selected_stock['name']} ({selected_stock['ticker']})")
+                    if time_ago.days > 0:
+                        time_str = f"{time_ago.days} dagen geleden"
+                    elif time_ago.seconds > 3600:
+                        time_str = f"{time_ago.seconds // 3600} uur geleden"
+                    else:
+                        time_str = f"{time_ago.seconds // 60} minuten geleden"
 
-                with col2:
-                    if st.button("📥 Importeer Dividenden", type="primary"):
-                        with st.spinner(f"Dividenden ophalen voor {selected_stock['ticker']}..."):
-                            result = fetch_dividends_from_alphavantage(selected_stock['ticker'])
-
-                            if 'error' in result:
-                                st.error(f"❌ {result['error']}")
-                            elif 'dividends' in result:
-                                dividends = result['dividends']
-
-                                if not dividends:
-                                    st.info(f"Geen dividend geschiedenis gevonden voor {selected_stock['ticker']}")
-                                else:
-                                    st.success(f"✓ {len(dividends)} dividenden gevonden!")
-
-                                    # Importeer dividenden
-                                    imported_count = 0
-                                    skipped_count = 0
-
-                                    with st.spinner("Dividenden importeren..."):
-                                        for div in dividends:
-                                            was_imported = import_dividend_to_db(
-                                                selected_stock['ticker'],
-                                                selected_stock['isin'],
-                                                div['ex_date'],
-                                                div['amount']
-                                            )
-
-                                            if was_imported:
-                                                imported_count += 1
-                                            else:
-                                                skipped_count += 1
-
-                                    st.success(f"✓ Import voltooid! {imported_count} nieuwe dividenden toegevoegd.")
-
-                                    if skipped_count > 0:
-                                        st.info(f"ℹ️ {skipped_count} dividenden overgeslagen (al in database)")
-
-                                    st.rerun()
+                    st.caption(f"📅 Laatst opgehaald: {last_updated_dt.strftime('%Y-%m-%d %H:%M:%S')} ({time_str})")
 
             st.divider()
 
-            # Bulk import optie
-            st.write("### 🚀 Bulk Import")
-            st.write("Importeer dividenden voor alle aandelen in je portfolio in één keer.")
+            # Stap 2: Bekijk en Importeer Buffer Data
+            st.write("### 📋 Stap 2: Bekijk Buffer & Importeer")
 
-            if st.button("📥 Importeer Alle Dividenden", type="secondary"):
-                total_imported = 0
-                total_skipped = 0
-                errors = []
+            # Haal alle cached data op
+            cached_data = get_cached_dividends()
 
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            if cached_data.empty:
+                st.info("Nog geen data in de buffer. Haal eerst data op via Stap 1.")
+            else:
+                # Filter opties
+                col1, col2 = st.columns([3, 1])
 
-                for idx, stock in enumerate(portfolio_stocks):
-                    status_text.write(f"Bezig met {stock['name']} ({stock['ticker']})...")
-                    progress_bar.progress((idx + 1) / len(portfolio_stocks))
+                with col1:
+                    filter_ticker = st.selectbox(
+                        "Filter op aandeel:",
+                        options=["Alle aandelen"] + sorted(cached_data['ticker'].unique().tolist()),
+                        key="filter_ticker"
+                    )
 
-                    result = fetch_dividends_from_alphavantage(stock['ticker'])
+                with col2:
+                    st.write("")  # Spacer
+                    st.write("")  # Spacer
+                    if filter_ticker != "Alle aandelen":
+                        if st.button("🗑️ Wis Buffer", type="secondary", use_container_width=True):
+                            deleted = clear_cache(filter_ticker)
+                            st.success(f"✓ {deleted} items verwijderd uit buffer")
+                            st.rerun()
 
-                    if 'error' in result:
-                        errors.append(f"{stock['ticker']}: {result['error']}")
-                    elif 'dividends' in result:
-                        for div in result['dividends']:
-                            was_imported = import_dividend_to_db(
-                                stock['ticker'],
-                                stock['isin'],
-                                div['ex_date'],
-                                div['amount']
-                            )
+                # Filter data
+                if filter_ticker != "Alle aandelen":
+                    display_data = cached_data[cached_data['ticker'] == filter_ticker].copy()
+                else:
+                    display_data = cached_data.copy()
 
-                            if was_imported:
-                                total_imported += 1
-                            else:
-                                total_skipped += 1
+                # Format de data voor display
+                display_data['fetched_at_formatted'] = pd.to_datetime(display_data['fetched_at']).dt.strftime('%Y-%m-%d %H:%M')
+                display_data['amount_formatted'] = display_data['amount'].apply(lambda x: f"€{x:.4f}")
 
-                status_text.empty()
-                progress_bar.empty()
+                st.dataframe(
+                    display_data[['ticker', 'ex_date', 'amount_formatted', 'fetched_at_formatted']].rename(columns={
+                        'ticker': 'Ticker',
+                        'ex_date': 'Ex-Dividend Datum',
+                        'amount_formatted': 'Bedrag',
+                        'fetched_at_formatted': 'Opgehaald op'
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
-                st.success(f"✓ Bulk import voltooid! {total_imported} nieuwe dividenden toegevoegd.")
+                st.write(f"**{len(display_data)} dividenden in buffer**")
 
-                if total_skipped > 0:
-                    st.info(f"ℹ️ {total_skipped} dividenden overgeslagen (al in database)")
+                # Import knoppen
+                col1, col2, col3 = st.columns(3)
 
-                if errors:
-                    with st.expander("⚠️ Errors tijdens import", expanded=False):
-                        for error in errors:
-                            st.warning(error)
+                with col1:
+                    if filter_ticker != "Alle aandelen":
+                        if st.button("✅ Importeer Alles van " + filter_ticker, type="primary", use_container_width=True):
+                            result = import_all_from_cache_to_db(filter_ticker)
 
-                st.rerun()
+                            if result['imported'] > 0:
+                                st.success(f"✓ {result['imported']} dividenden geïmporteerd!")
+
+                            if result['skipped'] > 0:
+                                st.info(f"ℹ️ {result['skipped']} dividenden overgeslagen (al in database)")
+
+                            if result['imported'] == 0 and result['skipped'] == 0:
+                                st.warning("Geen dividenden om te importeren")
+
+                            st.rerun()
+
+                with col2:
+                    if st.button("🗑️ Wis Hele Buffer", type="secondary", use_container_width=True):
+                        deleted = clear_cache()
+                        st.success(f"✓ {deleted} items verwijderd uit buffer")
+                        st.rerun()
 
             st.divider()
             st.warning("""
             **Let op:**
             - Alpha Vantage heeft rate limits (25 API calls per dag voor gratis accounts)
             - Niet alle aandelen zijn beschikbaar in Alpha Vantage (vooral Europese aandelen kunnen ontbreken)
-            - De bulk import kan enkele minuten duren
+            - Data wordt eerst in een buffer opgeslagen zodat je deze kan controleren
+            - Gebruik de buffer om te voorkomen dat je dubbele data importeert
             """)
 
 # Nuttige links en bronnen
