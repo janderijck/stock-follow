@@ -221,6 +221,8 @@ st.title("Transactie invoeren")
 # Initialize session state
 if 'security_data' not in st.session_state:
     st.session_state.security_data = {}
+if 'lookup_result' not in st.session_state:
+    st.session_state.lookup_result = None
 
 # ISIN Lookup Section
 st.subheader("ISIN Opzoeken")
@@ -242,7 +244,7 @@ with col_lookup2:
                 result = lookup_isin(isin_lookup)
 
                 if result and 'error' not in result:
-                    st.session_state.security_data = {
+                    st.session_state.lookup_result = {
                         'name': result.get('name', ''),
                         'ticker': result.get('ticker', ''),
                         'isin': isin_lookup.upper(),
@@ -251,14 +253,33 @@ with col_lookup2:
                     st.success(f"✓ Gevonden: {result.get('name', 'Unknown')} ({result.get('ticker', 'N/A')})")
                 elif result and 'error' in result:
                     st.error(result['error'])
+                    st.session_state.lookup_result = None
                 else:
                     st.error("Kon geen informatie ophalen voor dit ISIN")
+                    st.session_state.lookup_result = None
         else:
             st.warning("Voer eerst een ISIN in")
 
-# Show current loaded data
+# Show lookup result with button to use it
+if st.session_state.lookup_result:
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        st.info(f"📊 Gevonden: {st.session_state.lookup_result.get('name', 'N/A')} - {st.session_state.lookup_result.get('ticker', 'N/A')}")
+
+    with col2:
+        if st.button("✅ Gebruik deze gegevens", type="primary"):
+            st.session_state.security_data = st.session_state.lookup_result.copy()
+            st.session_state.lookup_result = None
+            st.success("Gegevens overgenomen!")
+            st.rerun()
+
+# Show currently selected data
 if st.session_state.security_data:
-    st.info(f"📊 Geladen: {st.session_state.security_data.get('name', 'N/A')} - {st.session_state.security_data.get('ticker', 'N/A')}")
+    st.success(f"✓ Geselecteerd: {st.session_state.security_data.get('name', 'N/A')} ({st.session_state.security_data.get('ticker', 'N/A')})")
+    if st.button("🗑️ Wis selectie"):
+        st.session_state.security_data = {}
+        st.rerun()
 
 st.divider()
 
