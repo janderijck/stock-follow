@@ -32,6 +32,7 @@ def get_connection():
             isin TEXT,
             ex_date TEXT NOT NULL,
             amount REAL NOT NULL,
+            currency TEXT DEFAULT 'USD',
             fetched_at TEXT NOT NULL,
             UNIQUE(ticker, ex_date)
         )
@@ -46,6 +47,18 @@ def get_connection():
         cursor.execute("ALTER TABLE dividends ADD COLUMN received INTEGER DEFAULT 0")
         conn.commit()
 
+    if 'currency' not in columns:
+        cursor.execute("ALTER TABLE dividends ADD COLUMN currency TEXT DEFAULT 'USD'")
+        conn.commit()
+
+    # Migratie: Voeg 'currency' kolom toe aan dividend_cache als deze nog niet bestaat
+    cursor.execute("PRAGMA table_info(dividend_cache)")
+    cache_columns = [col[1] for col in cursor.fetchall()]
+
+    if 'currency' not in cache_columns:
+        cursor.execute("ALTER TABLE dividend_cache ADD COLUMN currency TEXT DEFAULT 'USD'")
+        conn.commit()
+
     return conn
 
 
@@ -57,6 +70,28 @@ def get_setting(key, default=None):
     result = cursor.fetchone()
     conn.close()
     return result[0] if result else default
+
+
+def format_currency(amount, currency='USD'):
+    """Format een bedrag met het juiste currency symbool."""
+    currency_symbols = {
+        'USD': '$',
+        'EUR': '€',
+        'GBP': '£',
+        'JPY': '¥',
+        'CHF': 'CHF ',
+        'CAD': 'C$',
+        'AUD': 'A$',
+    }
+
+    symbol = currency_symbols.get(currency, currency + ' ')
+
+    # Voor symbolen die achter het bedrag staan (zoals EUR)
+    if currency == 'EUR':
+        return f"€{amount:.2f}"
+    else:
+        # Voor symbolen die voor het bedrag staan (zoals USD)
+        return f"{symbol}{amount:.2f}"
 
 
 def update_dividend_received_status(dividend_id, received):
@@ -82,6 +117,7 @@ def get_all_dividends():
             d.isin,
             d.ex_date,
             d.bruto_amount,
+            d.currency,
             d.notes,
             d.received,
             t.name
@@ -165,6 +201,33 @@ def predict_next_dividend(ticker):
     return None
 
 
+def get_currency_for_ticker(ticker):
+    """Detecteert de currency voor een ticker uit transactions tabel of yfinance."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Probeer eerst uit transactions tabel
+    cursor.execute(
+        "SELECT currency FROM transactions WHERE ticker = ? LIMIT 1",
+        (ticker,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+
+    if result:
+        return result[0]
+
+    # Als niet in transactions, probeer uit yfinance
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        currency = info.get('currency', 'USD')
+        return currency
+    except:
+        # Default naar USD als alles faalt
+        return 'USD'
+
+
 def fetch_dividends_from_yfinance(ticker, debug=False):
     """Haalt dividend geschiedenis op van Yahoo Finance via yfinance."""
     try:
@@ -174,10 +237,14 @@ def fetch_dividends_from_yfinance(ticker, debug=False):
         # Get dividend history
         dividends_series = stock.dividends
 
+        # Get currency
+        currency = get_currency_for_ticker(ticker)
+
         if debug:
             return {
                 'debug': {
                     'ticker': ticker,
+                    'currency': currency,
                     'dividends_count': len(dividends_series),
                     'dividends_series': dividends_series.to_dict(),
                     'info_keys': list(stock.info.keys()) if hasattr(stock, 'info') else []
@@ -198,7 +265,7 @@ def fetch_dividends_from_yfinance(ticker, debug=False):
         # Sort by date descending (most recent first)
         dividends.sort(key=lambda x: x['ex_date'], reverse=True)
 
-        return {'dividends': dividends}
+        return {'dividends': dividends, 'currency': currency}
 
     except Exception as e:
         return {'error': f'Fout bij ophalen van dividend data: {str(e)}'}
@@ -267,7 +334,7 @@ def fetch_dividends_from_alphavantage(ticker, debug=False):
         return {'error': f'Onverwachte fout: {str(e)}'}
 
 
-def save_dividends_to_cache(ticker, isin, dividends):
+def save_dividends_to_cache(ticker, isin, dividends, currency='USD'):
     """Slaat dividend data op in de cache buffer tabel."""
     conn = get_connection()
     cursor = conn.cursor()
@@ -280,12 +347,12 @@ def save_dividends_to_cache(ticker, isin, dividends):
         try:
             cursor.execute(
                 """
-                INSERT INTO dividend_cache (ticker, isin, ex_date, amount, fetched_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO dividend_cache (ticker, isin, ex_date, amount, currency, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker, ex_date)
-                DO UPDATE SET amount = ?, fetched_at = ?
+                DO UPDATE SET amount = ?, currency = ?, fetched_at = ?
                 """,
-                (ticker, isin, div['ex_date'], div['amount'], fetched_at, div['amount'], fetched_at)
+                (ticker, isin, div['ex_date'], div['amount'], currency, fetched_at, div['amount'], currency, fetched_at)
             )
             if cursor.rowcount == 1:
                 added_count += 1
@@ -306,7 +373,7 @@ def get_cached_dividends(ticker=None):
 
     if ticker:
         query = """
-            SELECT ticker, isin, ex_date, amount, fetched_at
+            SELECT ticker, isin, ex_date, amount, currency, fetched_at
             FROM dividend_cache
             WHERE ticker = ?
             ORDER BY ex_date DESC
@@ -314,7 +381,7 @@ def get_cached_dividends(ticker=None):
         df = pd.read_sql_query(query, conn, params=(ticker,))
     else:
         query = """
-            SELECT ticker, isin, ex_date, amount, fetched_at
+            SELECT ticker, isin, ex_date, amount, currency, fetched_at
             FROM dividend_cache
             ORDER BY ticker, ex_date DESC
         """
@@ -364,7 +431,7 @@ def import_from_cache_to_db(ticker, ex_date):
     # Haal dividend op uit cache
     cursor.execute(
         """
-        SELECT ticker, isin, ex_date, amount
+        SELECT ticker, isin, ex_date, amount, currency
         FROM dividend_cache
         WHERE ticker = ? AND ex_date = ?
         """,
@@ -377,7 +444,7 @@ def import_from_cache_to_db(ticker, ex_date):
         conn.close()
         return {'success': False, 'error': 'Dividend niet gevonden in cache'}
 
-    ticker, isin, ex_date, amount = cache_row
+    ticker, isin, ex_date, amount, currency = cache_row
 
     # Check of deze dividend al bestaat in de database
     cursor.execute(
@@ -392,10 +459,10 @@ def import_from_cache_to_db(ticker, ex_date):
     # Insert nieuwe dividend
     cursor.execute(
         """
-        INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, currency, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (ticker, isin, ex_date, amount, "Geïmporteerd van Yahoo Finance via cache")
+        (ticker, isin, ex_date, amount, currency, "Geïmporteerd van Yahoo Finance via cache")
     )
 
     conn.commit()
@@ -412,7 +479,7 @@ def import_all_from_cache_to_db(ticker):
     # Haal alle cached dividenden op voor deze ticker
     cursor.execute(
         """
-        SELECT ticker, isin, ex_date, amount
+        SELECT ticker, isin, ex_date, amount, currency
         FROM dividend_cache
         WHERE ticker = ?
         """,
@@ -429,7 +496,7 @@ def import_all_from_cache_to_db(ticker):
     skipped_count = 0
 
     for row in cache_rows:
-        ticker, isin, ex_date, amount = row
+        ticker, isin, ex_date, amount, currency = row
 
         # Check of deze dividend al bestaat
         cursor.execute(
@@ -444,10 +511,10 @@ def import_all_from_cache_to_db(ticker):
         # Insert nieuwe dividend
         cursor.execute(
             """
-            INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, currency, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (ticker, isin, ex_date, amount, "Geïmporteerd van Yahoo Finance via cache")
+            (ticker, isin, ex_date, amount, currency, "Geïmporteerd van Yahoo Finance via cache")
         )
         imported_count += 1
 
@@ -548,6 +615,7 @@ with tab1:
         for _, row in filtered_df.iterrows():
             tax = row['bruto_amount'] * TAX_RATE
             netto = row['bruto_amount'] - tax
+            currency = row.get('currency', 'USD')
 
             # Check if past or future
             ex_date = pd.to_datetime(row['ex_date'])
@@ -558,9 +626,10 @@ with tab1:
                 'Ex-Dividend Datum': row['ex_date'].strftime('%Y-%m-%d'),
                 'Aandeel': row['name'] if pd.notna(row['name']) else row['ticker'],
                 'Ticker': row['ticker'],
-                'Bruto': f"€{row['bruto_amount']:.2f}",
-                'Tax (30%)': f"€{tax:.2f}",
-                'Netto': f"€{netto:.2f}",
+                'Currency': currency,
+                'Bruto': format_currency(row['bruto_amount'], currency),
+                'Tax (30%)': format_currency(tax, currency),
+                'Netto': format_currency(netto, currency),
                 'Ontvangen': received_status,
                 'Notities': row['notes'] if pd.notna(row['notes']) and row['notes'] else '-'
             })
@@ -891,6 +960,7 @@ with tab4:
                         st.error(f"❌ {result['error']}")
                     elif 'dividends' in result:
                         dividends = result['dividends']
+                        currency = result.get('currency', 'USD')
 
                         if not dividends:
                             st.info(f"Geen dividend geschiedenis gevonden voor {selected_stock['ticker']}")
@@ -899,10 +969,11 @@ with tab4:
                             cache_result = save_dividends_to_cache(
                                 selected_stock['ticker'],
                                 selected_stock['isin'],
-                                dividends
+                                dividends,
+                                currency
                             )
 
-                            st.success(f"✓ {len(dividends)} dividenden opgehaald en opgeslagen in buffer!")
+                            st.success(f"✓ {len(dividends)} dividenden opgehaald en opgeslagen in buffer (currency: {currency})!")
                             st.info(f"ℹ️ Nieuw: {cache_result['added']}, Geüpdatet: {cache_result['updated']}")
                             st.rerun()
 
@@ -999,12 +1070,16 @@ with tab4:
 
                 # Format de data voor display
                 display_data['fetched_at_formatted'] = pd.to_datetime(display_data['fetched_at']).dt.strftime('%Y-%m-%d %H:%M')
-                display_data['amount_formatted'] = display_data['amount'].apply(lambda x: f"€{x:.4f}")
+                display_data['amount_formatted'] = display_data.apply(
+                    lambda row: format_currency(row['amount'], row.get('currency', 'USD')),
+                    axis=1
+                )
 
                 st.dataframe(
-                    display_data[['ticker', 'ex_date', 'amount_formatted', 'fetched_at_formatted']].rename(columns={
+                    display_data[['ticker', 'ex_date', 'currency', 'amount_formatted', 'fetched_at_formatted']].rename(columns={
                         'ticker': 'Ticker',
                         'ex_date': 'Ex-Dividend Datum',
+                        'currency': 'Currency',
                         'amount_formatted': 'Bedrag',
                         'fetched_at_formatted': 'Opgehaald op'
                     }),
