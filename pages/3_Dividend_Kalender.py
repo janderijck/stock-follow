@@ -36,7 +36,16 @@ def get_connection():
             UNIQUE(ticker, ex_date)
         )
     """)
-    conn.commit()
+
+    # Migratie: Voeg 'received' kolom toe aan dividends tabel als deze nog niet bestaat
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(dividends)")
+    columns = [col[1] for col in cursor.fetchall()]
+
+    if 'received' not in columns:
+        cursor.execute("ALTER TABLE dividends ADD COLUMN received INTEGER DEFAULT 0")
+        conn.commit()
+
     return conn
 
 
@@ -50,17 +59,31 @@ def get_setting(key, default=None):
     return result[0] if result else default
 
 
+def update_dividend_received_status(dividend_id, received):
+    """Update de received status van een dividend."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE dividends SET received = ? WHERE id = ?",
+        (1 if received else 0, dividend_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_all_dividends():
     """Haalt alle dividend uitkeringen op."""
     conn = get_connection()
     df = pd.read_sql_query(
         """
         SELECT
+            d.id,
             d.ticker,
             d.isin,
             d.ex_date,
             d.bruto_amount,
             d.notes,
+            d.received,
             t.name
         FROM dividends d
         LEFT JOIN (
@@ -526,6 +549,11 @@ with tab1:
             tax = row['bruto_amount'] * TAX_RATE
             netto = row['bruto_amount'] - tax
 
+            # Check if past or future
+            ex_date = pd.to_datetime(row['ex_date'])
+            is_future = ex_date > pd.Timestamp.now()
+            received_status = "🔮 Toekomst" if is_future else ("✅ Ja" if row.get('received', 0) else "❌ Nee")
+
             display_data.append({
                 'Ex-Dividend Datum': row['ex_date'].strftime('%Y-%m-%d'),
                 'Aandeel': row['name'] if pd.notna(row['name']) else row['ticker'],
@@ -533,6 +561,7 @@ with tab1:
                 'Bruto': f"€{row['bruto_amount']:.2f}",
                 'Tax (30%)': f"€{tax:.2f}",
                 'Netto': f"€{netto:.2f}",
+                'Ontvangen': received_status,
                 'Notities': row['notes'] if pd.notna(row['notes']) and row['notes'] else '-'
             })
 
@@ -541,11 +570,15 @@ with tab1:
 
         # Statistieken
         st.divider()
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
 
         total_bruto = filtered_df['bruto_amount'].sum()
         total_tax = total_bruto * TAX_RATE
         total_netto = total_bruto - total_tax
+
+        # Calculate received vs not received
+        received_df = filtered_df[filtered_df['received'] == 1]
+        received_netto = (received_df['bruto_amount'].sum() * (1 - TAX_RATE)) if not received_df.empty else 0
 
         with col1:
             st.metric("Totaal Bruto", f"€{total_bruto:.2f}")
@@ -555,6 +588,9 @@ with tab1:
 
         with col3:
             st.metric("Totaal Netto", f"€{total_netto:.2f}")
+
+        with col4:
+            st.metric("Ontvangen (netto)", f"€{received_netto:.2f}", delta=f"{len(received_df)}/{len(filtered_df)}")
 
 # Tab 2: Kalender View
 with tab2:
@@ -613,6 +649,19 @@ with tab2:
             # Display calendar grid
             st.write("")
 
+            # Legend
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.caption("✅ = Alle ontvangen")
+            with col2:
+                st.caption("⚠️ = Deels ontvangen")
+            with col3:
+                st.caption("❌ = Niet ontvangen")
+            with col4:
+                st.caption("🔮 = Toekomstig")
+
+            st.write("")
+
             # Header with day names
             day_names = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo']
             cols = st.columns(7)
@@ -634,11 +683,34 @@ with tab2:
                                 num_dividends = len(dividend_days[day])
                                 total_amount = sum(d['bruto_amount'] for d in dividend_days[day])
 
+                                # Check if past or future
+                                date_check = datetime(selected_year, selected_month, day)
+                                is_past = date_check < datetime.now()
+                                is_future = date_check > datetime.now()
+
+                                # Check if received (for past dividends)
+                                all_received = all(d.get('received', 0) for d in dividend_days[day])
+                                some_received = any(d.get('received', 0) for d in dividend_days[day])
+
+                                # Determine button type and icon
+                                if is_future:
+                                    button_type = "secondary"
+                                    icon = "🔮"
+                                elif all_received:
+                                    button_type = "primary"
+                                    icon = "✅"
+                                elif some_received:
+                                    button_type = "primary"
+                                    icon = "⚠️"
+                                else:
+                                    button_type = "primary"
+                                    icon = "❌"
+
                                 if st.button(
-                                    f"**{day}**\n💰 {num_dividends}x\n€{total_amount:.0f}",
+                                    f"**{day}**\n{icon} {num_dividends}x\n€{total_amount:.0f}",
                                     key=f"day_{selected_year}_{selected_month}_{day}",
                                     use_container_width=True,
-                                    type="primary"
+                                    type=button_type
                                 ):
                                     # Store selected day in session state
                                     st.session_state['selected_dividend_day'] = day
@@ -654,14 +726,45 @@ with tab2:
             if selected_day and selected_day in dividend_days:
                 day_data = dividend_days[selected_day]
 
-                st.write(f"### 📋 Details voor {selected_day} {calendar.month_name[selected_month]} {selected_year}")
+                # Check if this is a past or future date
+                selected_date = datetime(selected_year, selected_month, selected_day)
+                is_past = selected_date < datetime.now()
+                is_future = selected_date > datetime.now()
+
+                if is_past:
+                    st.write(f"### 📋 Details voor {selected_day} {calendar.month_name[selected_month]} {selected_year} (Verleden)")
+                elif is_future:
+                    st.write(f"### 📋 Details voor {selected_day} {calendar.month_name[selected_month]} {selected_year} (Toekomst 🔮)")
+                else:
+                    st.write(f"### 📋 Details voor {selected_day} {calendar.month_name[selected_month]} {selected_year} (Vandaag)")
 
                 for dividend in day_data:
                     tax = dividend['bruto_amount'] * 0.30
                     netto = dividend['bruto_amount'] - tax
 
                     with st.container():
-                        st.write(f"**{dividend['name'] if pd.notna(dividend['name']) else dividend['ticker']}** ({dividend['ticker']})")
+                        col_name, col_received = st.columns([3, 1])
+
+                        with col_name:
+                            st.write(f"**{dividend['name'] if pd.notna(dividend['name']) else dividend['ticker']}** ({dividend['ticker']})")
+
+                        with col_received:
+                            # Only show checkbox for past/today dividends
+                            if not is_future:
+                                current_received = bool(dividend.get('received', 0))
+                                received_checkbox = st.checkbox(
+                                    "✅ Ontvangen",
+                                    value=current_received,
+                                    key=f"received_{dividend['id']}_{selected_year}_{selected_month}_{selected_day}"
+                                )
+
+                                # Update if changed
+                                if received_checkbox != current_received:
+                                    update_dividend_received_status(dividend['id'], received_checkbox)
+                                    st.success("✓ Status bijgewerkt")
+                                    st.rerun()
+                            else:
+                                st.info("🔮 Toekomstig")
 
                         col1, col2, col3 = st.columns(3)
                         with col1:
@@ -830,14 +933,53 @@ with tab4:
             if cached_data.empty:
                 st.info("Nog geen data in de buffer. Haal eerst data op via Stap 1.")
             else:
+                # Toon snel import optie bovenaan
+                unique_tickers = sorted(cached_data['ticker'].unique().tolist())
+
+                st.success(f"✅ {len(cached_data)} dividenden klaar om te importeren van {len(unique_tickers)} aandelen")
+
+                # Quick import all button
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    if st.button("⚡ Importeer ALLE dividenden nu", type="primary", use_container_width=True, key="quick_import_all"):
+                        imported_total = 0
+                        skipped_total = 0
+
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+
+                        for idx, ticker in enumerate(unique_tickers):
+                            status_text.write(f"Importeren van {ticker}...")
+                            progress_bar.progress((idx + 1) / len(unique_tickers))
+
+                            result = import_all_from_cache_to_db(ticker)
+                            imported_total += result['imported']
+                            skipped_total += result['skipped']
+
+                        progress_bar.empty()
+                        status_text.empty()
+
+                        if imported_total > 0:
+                            st.success(f"✓ {imported_total} dividenden geïmporteerd!")
+                        if skipped_total > 0:
+                            st.info(f"ℹ️ {skipped_total} dividenden overgeslagen (al in database)")
+
+                        st.rerun()
+
+                st.divider()
+                st.write("**Of selecteer specifiek aandeel:**")
+
                 # Filter opties
                 col1, col2 = st.columns([3, 1])
 
                 with col1:
+                    # Default to first ticker instead of "Alle aandelen"
+                    default_index = 1 if len(unique_tickers) > 0 else 0
                     filter_ticker = st.selectbox(
                         "Filter op aandeel:",
-                        options=["Alle aandelen"] + sorted(cached_data['ticker'].unique().tolist()),
-                        key="filter_ticker"
+                        options=["Alle aandelen"] + unique_tickers,
+                        key="filter_ticker",
+                        index=default_index
                     )
 
                 with col2:
