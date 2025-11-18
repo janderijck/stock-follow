@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
 
 DB_PATH = Path("data.db")
 
@@ -11,7 +12,43 @@ st.set_page_config(page_title="Admin - Database Beheer", page_icon="⚙️", lay
 # --------- Database helpers ---------
 def get_connection():
     """Maakt verbinding met de database."""
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+
+    # Zorg dat settings tabel bestaat
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """)
+
+    return conn
+
+
+def save_setting(key, value):
+    """Slaat een setting op in de database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        (key, value, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key, default=None):
+    """Haalt een setting op uit de database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else default
 
 
 def get_table_names():
@@ -68,7 +105,7 @@ st.title("⚙️ Admin - Database Beheer")
 st.warning("⚠️ **Let op:** Dit is een admin pagina. Gebruik voorzichtig!")
 
 # Tabbladen voor verschillende functies
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Tabel Data", "🔍 Custom Query", "📝 Schema Info", "📈 Database Stats"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Tabel Data", "🔍 Custom Query", "📝 Schema Info", "📈 Database Stats", "🔑 API Settings"])
 
 # Tab 1: Tabel Data
 with tab1:
@@ -237,3 +274,90 @@ with tab4:
     if not recent_df.empty:
         recent_df_sorted = recent_df.sort_values('date', ascending=False).head(10)
         st.dataframe(recent_df_sorted, use_container_width=True, hide_index=True)
+
+# Tab 5: API Settings
+with tab5:
+    st.subheader("🔑 API Keys en Instellingen")
+    st.info("Hier kun je API keys opslaan voor externe diensten zoals Alpha Vantage voor dividend data.")
+
+    # Alpha Vantage API Key
+    st.write("### Alpha Vantage API Key")
+    st.write("Alpha Vantage biedt gratis toegang tot financiële data, inclusief dividend informatie.")
+    st.write("📝 [Vraag gratis API key aan](https://www.alphavantage.co/support/#api-key)")
+
+    # Haal huidige key op
+    current_av_key = get_setting('alpha_vantage_api_key', '')
+
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        new_av_key = st.text_input(
+            "Alpha Vantage API Key",
+            value=current_av_key,
+            type="password",
+            help="Je API key wordt veilig opgeslagen in de database"
+        )
+
+    with col2:
+        st.write("")  # Spacing
+        st.write("")  # Spacing
+        if st.button("💾 Opslaan", type="primary"):
+            if new_av_key:
+                save_setting('alpha_vantage_api_key', new_av_key)
+                st.success("✓ Alpha Vantage API key opgeslagen!")
+                st.rerun()
+            else:
+                st.warning("Voer eerst een API key in")
+
+    # Toon status
+    if current_av_key:
+        masked_key = current_av_key[:4] + "•" * (len(current_av_key) - 8) + current_av_key[-4:]
+        st.success(f"✓ API Key actief: `{masked_key}`")
+
+        # Test key button
+        if st.button("🧪 Test API Key", type="secondary"):
+            st.info("API key test functionaliteit komt binnenkort...")
+    else:
+        st.warning("⚠️ Geen Alpha Vantage API key ingesteld. Sommige functies zijn mogelijk beperkt.")
+
+    # Andere API settings kunnen hier toegevoegd worden
+    st.divider()
+    st.write("### Andere Instellingen")
+
+    # Dividend tax rate
+    current_tax_rate = float(get_setting('dividend_tax_rate', '0.30'))
+
+    tax_rate = st.number_input(
+        "Roerende Voorheffing (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=current_tax_rate * 100,
+        step=0.1,
+        format="%.1f",
+        help="Standaard belastingtarief op dividenden (België: 30%)"
+    )
+
+    if st.button("💾 Opslaan Tax Rate"):
+        save_setting('dividend_tax_rate', str(tax_rate / 100))
+        st.success(f"✓ Roerende voorheffing ingesteld op {tax_rate}%")
+        st.rerun()
+
+    # Toon alle settings
+    st.divider()
+    st.write("### Alle Opgeslagen Settings")
+
+    conn = get_connection()
+    settings_df = pd.read_sql_query("SELECT * FROM settings ORDER BY updated_at DESC", conn)
+    conn.close()
+
+    if not settings_df.empty:
+        # Mask sensitive values
+        display_settings = settings_df.copy()
+        for idx, row in display_settings.iterrows():
+            if 'api_key' in row['key'].lower() or 'password' in row['key'].lower():
+                if len(row['value']) > 8:
+                    display_settings.at[idx, 'value'] = row['value'][:4] + "•" * (len(row['value']) - 8) + row['value'][-4:]
+
+        st.dataframe(display_settings, use_container_width=True, hide_index=True)
+    else:
+        st.info("Geen settings opgeslagen.")

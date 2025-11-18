@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime, timedelta
 import calendar
+import requests
 
 DB_PATH = Path("data.db")
 
@@ -13,7 +14,26 @@ st.set_page_config(page_title="Dividend Kalender", page_icon="📅", layout="wid
 # --------- Database helpers ---------
 def get_connection():
     """Maakt verbinding met de database."""
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    # Zorg dat settings tabel bestaat
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    return conn
+
+
+def get_setting(key, default=None):
+    """Haalt een setting op uit de database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else default
 
 
 def get_all_dividends():
@@ -108,12 +128,112 @@ def predict_next_dividend(ticker):
     return None
 
 
+def fetch_dividends_from_alphavantage(ticker):
+    """Haalt dividend geschiedenis op van Alpha Vantage API."""
+    api_key = get_setting('alpha_vantage_api_key', '')
+
+    if not api_key:
+        return {'error': 'Geen Alpha Vantage API key ingesteld. Ga naar Admin > API Settings.'}
+
+    try:
+        # Use TIME_SERIES_DAILY_ADJUSTED which includes dividend amounts
+        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&outputsize=full&apikey={api_key}"
+        response = requests.get(url, timeout=30)
+
+        if response.status_code != 200:
+            return {'error': f'API error: status {response.status_code}'}
+
+        data = response.json()
+
+        # Check for API errors
+        if 'Error Message' in data:
+            return {'error': data['Error Message']}
+
+        if 'Note' in data:
+            return {'error': 'API rate limit bereikt. Probeer het later opnieuw.'}
+
+        if 'Time Series (Daily)' not in data:
+            return {'error': 'Geen data beschikbaar voor dit aandeel'}
+
+        # Parse dividend data from time series
+        time_series = data['Time Series (Daily)']
+        dividends = []
+
+        for date_str, daily_data in time_series.items():
+            dividend_amount = float(daily_data.get('7. dividend amount', 0))
+
+            # Only add dates where dividend was paid (amount > 0)
+            if dividend_amount > 0:
+                dividends.append({
+                    'ex_date': date_str,
+                    'amount': dividend_amount
+                })
+
+        # Sort by date descending (most recent first)
+        dividends.sort(key=lambda x: x['ex_date'], reverse=True)
+
+        return {'dividends': dividends}
+
+    except requests.exceptions.Timeout:
+        return {'error': 'API timeout - probeer het opnieuw'}
+    except requests.exceptions.RequestException as e:
+        return {'error': f'Netwerk error: {str(e)}'}
+    except Exception as e:
+        return {'error': f'Onverwachte fout: {str(e)}'}
+
+
+def import_dividend_to_db(ticker, isin, ex_date, amount):
+    """Importeert een dividend uitkering in de database."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Check of deze dividend al bestaat
+    cursor.execute(
+        "SELECT id FROM dividends WHERE ticker = ? AND ex_date = ?",
+        (ticker, ex_date)
+    )
+
+    if cursor.fetchone():
+        conn.close()
+        return False  # Al bestaand
+
+    # Insert nieuwe dividend
+    cursor.execute(
+        """
+        INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (ticker, isin, ex_date, amount, "Automatisch geïmporteerd van Alpha Vantage")
+    )
+
+    conn.commit()
+    conn.close()
+    return True  # Nieuw toegevoegd
+
+
+def get_portfolio_stocks_with_isin():
+    """Haalt alle unieke aandelen op uit de portfolio met ISIN."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT DISTINCT ticker, name, isin
+        FROM transactions
+        ORDER BY ticker
+    """)
+
+    result = cursor.fetchall()
+    conn.close()
+
+    return [{'ticker': row[0], 'name': row[1], 'isin': row[2]} for row in result]
+
+
 # --------- UI ---------
 st.title("📅 Dividend Kalender")
 st.write("Overzicht van dividend uitkeringen en voorspellingen")
 
 # Tabs voor verschillende views
-tab1, tab2, tab3 = st.tabs(["📊 Overzicht", "📅 Kalender View", "🔮 Voorspellingen"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Overzicht", "📅 Kalender View", "🔮 Voorspellingen", "⬇️ Import Dividenden"])
 
 # Tab 1: Overzicht
 with tab1:
@@ -282,6 +402,141 @@ with tab3:
                     st.success(f"**{p['Aandeel']}** ({p['Ticker']}) - {p['Voorspelde Datum']} (over {p['Dagen tot uitkering']} dagen)")
         else:
             st.info("Niet genoeg historische data om voorspellingen te maken. Voeg minstens 2 dividenden per aandeel toe.")
+
+# Tab 4: Import Dividenden
+with tab4:
+    st.subheader("⬇️ Dividend Geschiedenis Importeren")
+    st.info("📡 Importeer automatisch dividend geschiedenis van Alpha Vantage voor je portfolio aandelen.")
+
+    # Check of API key is ingesteld
+    api_key = get_setting('alpha_vantage_api_key', '')
+
+    if not api_key:
+        st.warning("⚠️ Geen Alpha Vantage API key ingesteld!")
+        st.write("Ga naar **Admin > API Settings** om je API key in te stellen.")
+        st.write("[Vraag gratis API key aan](https://www.alphavantage.co/support/#api-key)")
+    else:
+        st.success("✓ Alpha Vantage API key actief")
+
+        # Haal portfolio aandelen op
+        portfolio_stocks = get_portfolio_stocks_with_isin()
+
+        if not portfolio_stocks:
+            st.warning("Geen aandelen gevonden in je portfolio.")
+        else:
+            st.write(f"**{len(portfolio_stocks)} aandelen gevonden in je portfolio**")
+
+            # Selecteer aandeel
+            selected_stock = st.selectbox(
+                "Selecteer aandeel om dividenden te importeren:",
+                options=portfolio_stocks,
+                format_func=lambda x: f"{x['name']} ({x['ticker']})"
+            )
+
+            if selected_stock:
+                col1, col2 = st.columns([2, 1])
+
+                with col1:
+                    st.write(f"**Geselecteerd:** {selected_stock['name']} ({selected_stock['ticker']})")
+
+                with col2:
+                    if st.button("📥 Importeer Dividenden", type="primary"):
+                        with st.spinner(f"Dividenden ophalen voor {selected_stock['ticker']}..."):
+                            result = fetch_dividends_from_alphavantage(selected_stock['ticker'])
+
+                            if 'error' in result:
+                                st.error(f"❌ {result['error']}")
+                            elif 'dividends' in result:
+                                dividends = result['dividends']
+
+                                if not dividends:
+                                    st.info(f"Geen dividend geschiedenis gevonden voor {selected_stock['ticker']}")
+                                else:
+                                    st.success(f"✓ {len(dividends)} dividenden gevonden!")
+
+                                    # Importeer dividenden
+                                    imported_count = 0
+                                    skipped_count = 0
+
+                                    with st.spinner("Dividenden importeren..."):
+                                        for div in dividends:
+                                            was_imported = import_dividend_to_db(
+                                                selected_stock['ticker'],
+                                                selected_stock['isin'],
+                                                div['ex_date'],
+                                                div['amount']
+                                            )
+
+                                            if was_imported:
+                                                imported_count += 1
+                                            else:
+                                                skipped_count += 1
+
+                                    st.success(f"✓ Import voltooid! {imported_count} nieuwe dividenden toegevoegd.")
+
+                                    if skipped_count > 0:
+                                        st.info(f"ℹ️ {skipped_count} dividenden overgeslagen (al in database)")
+
+                                    st.rerun()
+
+            st.divider()
+
+            # Bulk import optie
+            st.write("### 🚀 Bulk Import")
+            st.write("Importeer dividenden voor alle aandelen in je portfolio in één keer.")
+
+            if st.button("📥 Importeer Alle Dividenden", type="secondary"):
+                total_imported = 0
+                total_skipped = 0
+                errors = []
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                for idx, stock in enumerate(portfolio_stocks):
+                    status_text.write(f"Bezig met {stock['name']} ({stock['ticker']})...")
+                    progress_bar.progress((idx + 1) / len(portfolio_stocks))
+
+                    result = fetch_dividends_from_alphavantage(stock['ticker'])
+
+                    if 'error' in result:
+                        errors.append(f"{stock['ticker']}: {result['error']}")
+                    elif 'dividends' in result:
+                        for div in result['dividends']:
+                            was_imported = import_dividend_to_db(
+                                stock['ticker'],
+                                stock['isin'],
+                                div['ex_date'],
+                                div['amount']
+                            )
+
+                            if was_imported:
+                                total_imported += 1
+                            else:
+                                total_skipped += 1
+
+                status_text.empty()
+                progress_bar.empty()
+
+                st.success(f"✓ Bulk import voltooid! {total_imported} nieuwe dividenden toegevoegd.")
+
+                if total_skipped > 0:
+                    st.info(f"ℹ️ {total_skipped} dividenden overgeslagen (al in database)")
+
+                if errors:
+                    with st.expander("⚠️ Errors tijdens import", expanded=False):
+                        for error in errors:
+                            st.warning(error)
+
+                st.rerun()
+
+            st.divider()
+            st.warning("""
+            **Let op:**
+            - Alpha Vantage heeft rate limits (25 API calls per dag voor gratis accounts)
+            - Niet alle aandelen zijn beschikbaar in Alpha Vantage (vooral Europese aandelen kunnen ontbreken)
+            - De bulk import kan enkele minuten duren
+            """)
 
 # Nuttige links en bronnen
 st.divider()
