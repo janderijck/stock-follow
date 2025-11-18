@@ -6,6 +6,11 @@ from datetime import datetime, timedelta
 import calendar
 import requests
 import yfinance as yf
+import sys
+
+# Add parent directory to path for imports
+sys.path.append(str(Path(__file__).parent.parent))
+from tax_calculator import TaxCalculator
 
 DB_PATH = Path("data.db")
 
@@ -53,6 +58,19 @@ def get_connection():
 
     if 'tax_paid' not in columns:
         cursor.execute("ALTER TABLE dividends ADD COLUMN tax_paid INTEGER DEFAULT 1")
+        conn.commit()
+
+    # Voeg kolommen toe voor gedetailleerde belasting tracking
+    if 'withheld_amount' not in columns:
+        cursor.execute("ALTER TABLE dividends ADD COLUMN withheld_amount REAL DEFAULT 0")
+        conn.commit()
+
+    if 'additional_tax_due' not in columns:
+        cursor.execute("ALTER TABLE dividends ADD COLUMN additional_tax_due REAL DEFAULT 0")
+        conn.commit()
+
+    if 'net_received' not in columns:
+        cursor.execute("ALTER TABLE dividends ADD COLUMN net_received REAL")
         conn.commit()
 
     # Migratie: Voeg 'currency' kolom toe aan dividend_cache als deze nog niet bestaat
@@ -122,6 +140,55 @@ def update_dividend_tax_paid_status(dividend_id, tax_paid):
     conn.close()
 
 
+def update_dividend_tax_details(dividend_id, withheld_amount, additional_tax_due, net_received):
+    """Update de gedetailleerde tax informatie van een dividend."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """UPDATE dividends
+           SET withheld_amount = ?, additional_tax_due = ?, net_received = ?
+           WHERE id = ?""",
+        (withheld_amount, additional_tax_due, net_received, dividend_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_dividend(ticker, isin, ex_date, bruto_amount, currency='EUR', notes='',
+                    received=False, tax_paid=True, withheld_amount=0,
+                    additional_tax_due=0, net_received=None):
+    """
+    Voeg een dividend toe aan de database.
+
+    Args:
+        ticker: Stock ticker
+        isin: ISIN code
+        ex_date: Ex-dividend datum
+        bruto_amount: Bruto dividend bedrag
+        currency: Valuta (default EUR)
+        notes: Notities
+        received: Of dividend ontvangen is
+        tax_paid: Of belasting is betaald
+        withheld_amount: Al ingehouden belasting
+        additional_tax_due: Nog te betalen belasting
+        net_received: Netto ontvangen bedrag
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO dividends
+        (ticker, isin, ex_date, bruto_amount, currency, notes, received, tax_paid,
+         withheld_amount, additional_tax_due, net_received)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (ticker, isin, ex_date, bruto_amount, currency, notes,
+          1 if received else 0, 1 if tax_paid else 0,
+          withheld_amount, additional_tax_due, net_received))
+
+    conn.commit()
+    conn.close()
+
+
 def get_all_dividends():
     """Haalt alle dividend uitkeringen op."""
     conn = get_connection()
@@ -137,6 +204,9 @@ def get_all_dividends():
             d.notes,
             d.received,
             d.tax_paid,
+            d.withheld_amount,
+            d.additional_tax_due,
+            d.net_received,
             t.name
         FROM dividends d
         LEFT JOIN (
@@ -174,6 +244,63 @@ def get_active_portfolio_tickers():
     conn.close()
 
     return {row[0]: row[1] for row in result}
+
+
+def get_broker_for_ticker(ticker):
+    """Haal de meest recente broker op voor een ticker."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT broker
+        FROM transactions
+        WHERE ticker = ?
+        ORDER BY date DESC
+        LIMIT 1
+    """, (ticker,))
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return result[0] if result else None
+
+
+def had_shares_on_date(ticker, check_date):
+    """
+    Check of je aandelen in bezit had op een bepaalde datum.
+
+    Args:
+        ticker: De ticker van het aandeel
+        check_date: De datum om te checken (string of datetime)
+
+    Returns:
+        int: Aantal aandelen in bezit op die datum (0 als geen)
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Converteer check_date naar string als het een datetime is
+    if hasattr(check_date, 'strftime'):
+        check_date_str = check_date.strftime('%Y-%m-%d')
+    else:
+        check_date_str = str(check_date)
+
+    # Tel alle BUY en SELL transacties tot en met deze datum
+    cursor.execute("""
+        SELECT SUM(CASE
+            WHEN transaction_type = 'BUY' THEN quantity
+            WHEN transaction_type = 'SELL' THEN -quantity
+            ELSE 0
+        END) as shares
+        FROM transactions
+        WHERE ticker = ? AND date <= ?
+    """, (ticker, check_date_str))
+
+    result = cursor.fetchone()
+    conn.close()
+
+    shares = result[0] if result[0] is not None else 0
+    return shares
 
 
 def predict_next_dividend(ticker):
@@ -592,17 +719,47 @@ st.title("📅 Dividend Kalender")
 st.write("Overzicht van dividend uitkeringen en voorspellingen")
 
 # Tabs voor verschillende views
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Overzicht", "📅 Kalender View", "🔮 Voorspellingen", "⬇️ Import Dividenden"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overzicht", "📅 Kalender View", "🔮 Voorspellingen", "➕ Dividend Toevoegen", "⬇️ Import Dividenden"])
 
 # Tab 1: Overzicht
 with tab1:
     st.subheader("Alle Dividend Uitkeringen")
 
+    # Toggle voor ownership filter
+    show_only_owned = st.checkbox(
+        "✅ Toon alleen dividenden van aandelen die ik in bezit had",
+        value=True,
+        help="Filter dividenden: toon alleen dividenden van aandelen die je in bezit had op de ex-dividend datum"
+    )
+
     dividends_df = get_all_dividends()
+    total_dividends_count = len(dividends_df)
 
     if dividends_df.empty:
         st.info("Nog geen dividend uitkeringen geregistreerd.")
     else:
+        # Filter: alleen dividenden van aandelen die je in bezit had op ex-dividend datum
+        if show_only_owned:
+            dividends_with_ownership = []
+            for _, row in dividends_df.iterrows():
+                ex_date = pd.to_datetime(row['ex_date'])
+                shares_owned = had_shares_on_date(row['ticker'], ex_date)
+
+                if shares_owned > 0:
+                    dividends_with_ownership.append(row)
+
+            # Converteer terug naar DataFrame
+            if dividends_with_ownership:
+                dividends_df = pd.DataFrame(dividends_with_ownership)
+                filtered_count = len(dividends_df)
+                filtered_out = total_dividends_count - filtered_count
+                if filtered_out > 0:
+                    st.info(f"ℹ️ {filtered_count} van {total_dividends_count} dividenden getoond ({filtered_out} dividenden gefilterd van aandelen die je niet in bezit had)")
+            else:
+                st.info("Geen dividenden van aandelen die je in bezit had op de ex-dividend datum.")
+                dividends_df = pd.DataFrame()
+
+    if not dividends_df.empty:
         # Filter opties
         col1, col2 = st.columns(2)
 
@@ -625,21 +782,63 @@ with tab1:
         if ticker_filter != 'Alle':
             filtered_df = filtered_df[filtered_df['ticker'] == ticker_filter]
 
-        # Display tabel
-        TAX_RATE = 0.30
+        # Display tabel met intelligente tax berekening
+        tax_calc = TaxCalculator()
 
         display_data = []
         for _, row in filtered_df.iterrows():
-            tax_paid = row.get('tax_paid', 1)
-            tax = (row['bruto_amount'] * TAX_RATE) if tax_paid else 0
-            netto = row['bruto_amount'] - tax
-            currency = row.get('currency', 'USD')
-
             # Check if past or future
             ex_date = pd.to_datetime(row['ex_date'])
             is_future = ex_date > pd.Timestamp.now()
-            received_status = "🔮 Toekomst" if is_future else ("✅ Ja" if row.get('received', 0) else "❌ Nee")
-            tax_status = "✅ Ja" if tax_paid else "❌ Nee"
+            is_received = row.get('received', 0)
+            tax_paid = row.get('tax_paid', 1)
+            currency = row.get('currency', 'USD')
+
+            # Haal broker op voor deze ticker
+            broker = get_broker_for_ticker(row['ticker'])
+
+            # Check of er handmatige tax waarden zijn ingevuld
+            withheld = row.get('withheld_amount', 0) or 0
+            additional_tax = row.get('additional_tax_due', 0) or 0
+            net_received_manual = row.get('net_received')
+
+            # Bereken tax (alleen als ontvangen en tax betaald)
+            if is_received and tax_paid:
+                # Als handmatige waarden zijn ingevuld, gebruik die
+                if withheld > 0 or additional_tax > 0 or net_received_manual:
+                    tax = withheld + additional_tax
+                    netto = net_received_manual if net_received_manual else (row['bruto_amount'] - tax)
+                    tax_info = 'Manual'
+                else:
+                    # Anders: gebruik automatische calculator
+                    tax_result = tax_calc.calculate_tax(row['bruto_amount'], row['ticker'], broker)
+                    tax = tax_result['total_tax']
+                    netto = tax_result['net_amount']
+                    tax_info = tax_result.get('asset_type', 'STOCK')
+            else:
+                tax = 0
+                netto = row['bruto_amount']
+                tax_info = ''
+
+            received_status = "🔮 Toekomst" if is_future else ("✅ Ja" if is_received else "❌ Nee")
+
+            # Tax status alleen tonen als ontvangen
+            if is_received:
+                tax_status = "✅ Ja" if tax_paid else "❌ Nee"
+            else:
+                tax_status = "-"
+
+            # Tax label afhankelijk van asset type of manual entry
+            tax_label = 'Tax'
+            if is_received and tax_paid:
+                if tax_info == 'Manual':
+                    tax_label = 'Tax (Manual)'
+                else:
+                    stock_info = tax_calc.get_stock_info(row['ticker'])
+                    if stock_info and stock_info['asset_type'] == 'REIT':
+                        tax_label = 'Tax (REIT)'
+                    elif stock_info and stock_info['country'] == 'Verenigde Staten':
+                        tax_label = 'Tax (US+BE)'
 
             display_data.append({
                 'Ex-Dividend Datum': row['ex_date'].strftime('%Y-%m-%d'),
@@ -647,7 +846,7 @@ with tab1:
                 'Ticker': row['ticker'],
                 'Currency': currency,
                 'Bruto': format_currency(row['bruto_amount'], currency),
-                'Tax (30%)': format_currency(tax, currency) if tax_paid else '-',
+                tax_label: format_currency(tax, currency) if (is_received and tax_paid) else '-',
                 'Netto': format_currency(netto, currency),
                 'Tax betaald': tax_status,
                 'Ontvangen': received_status,
@@ -667,9 +866,31 @@ with tab1:
 
         if not received_df.empty:
             total_bruto = received_df['bruto_amount'].sum()
-            # Calculate tax only for dividends where tax was actually paid
-            total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in received_df.iterrows() if row.get('tax_paid', 1))
-            total_netto = total_bruto - total_tax
+
+            # Calculate tax using intelligent tax calculator or manual values
+            total_tax = 0
+            total_netto = 0
+
+            for _, row in received_df.iterrows():
+                if row.get('tax_paid', 1):
+                    # Check voor handmatige tax waarden
+                    withheld = row.get('withheld_amount', 0) or 0
+                    additional_tax = row.get('additional_tax_due', 0) or 0
+                    net_received_manual = row.get('net_received')
+
+                    if withheld > 0 or additional_tax > 0 or net_received_manual:
+                        # Gebruik handmatige waarden
+                        total_tax += (withheld + additional_tax)
+                        total_netto += (net_received_manual if net_received_manual else (row['bruto_amount'] - withheld - additional_tax))
+                    else:
+                        # Gebruik automatische calculator
+                        broker = get_broker_for_ticker(row['ticker'])
+                        tax_result = tax_calc.calculate_tax(row['bruto_amount'], row['ticker'], broker)
+                        total_tax += tax_result['total_tax']
+                        total_netto += tax_result['net_amount']
+                else:
+                    # Geen tax betaald - voeg bruto toe aan netto
+                    total_netto += row['bruto_amount']
         else:
             total_bruto = 0
             total_tax = 0
@@ -691,11 +912,42 @@ with tab1:
 with tab2:
     st.subheader("Kalender View")
 
+    # Toggle voor ownership filter
+    show_only_owned_cal = st.checkbox(
+        "✅ Toon alleen dividenden van aandelen die ik in bezit had",
+        value=True,
+        key="show_only_owned_cal",
+        help="Filter dividenden: toon alleen dividenden van aandelen die je in bezit had op de ex-dividend datum"
+    )
+
     dividends_df = get_all_dividends()
+    total_dividends_count_cal = len(dividends_df)
 
     if dividends_df.empty:
         st.info("Nog geen dividend uitkeringen geregistreerd.")
     else:
+        # Filter: alleen dividenden van aandelen die je in bezit had op ex-dividend datum
+        if show_only_owned_cal:
+            dividends_with_ownership = []
+            for _, row in dividends_df.iterrows():
+                ex_date = pd.to_datetime(row['ex_date'])
+                shares_owned = had_shares_on_date(row['ticker'], ex_date)
+
+                if shares_owned > 0:
+                    dividends_with_ownership.append(row)
+
+            # Converteer terug naar DataFrame
+            if dividends_with_ownership:
+                dividends_df = pd.DataFrame(dividends_with_ownership)
+                filtered_count_cal = len(dividends_df)
+                filtered_out_cal = total_dividends_count_cal - filtered_count_cal
+                if filtered_out_cal > 0:
+                    st.info(f"ℹ️ {filtered_count_cal} van {total_dividends_count_cal} dividenden getoond ({filtered_out_cal} gefilterd)")
+            else:
+                st.info("Geen dividenden van aandelen die je in bezit had op de ex-dividend datum.")
+                dividends_df = pd.DataFrame()
+
+    if not dividends_df.empty:
         # Selecteer jaar en maand
         col1, col2, col3 = st.columns([2, 2, 1])
 
@@ -835,15 +1087,30 @@ with tab2:
 
                 for dividend in day_data:
                     tax_paid = bool(dividend.get('tax_paid', 1))
-                    tax = (dividend['bruto_amount'] * 0.30) if tax_paid else 0
-                    netto = dividend['bruto_amount'] - tax
                     currency = dividend.get('currency', 'USD')
+
+                    # Haal broker op en bereken tax intelligent
+                    broker = get_broker_for_ticker(dividend['ticker'])
+
+                    if tax_paid:
+                        tax_result = tax_calc.calculate_tax(dividend['bruto_amount'], dividend['ticker'], broker)
+                        tax = tax_result['total_tax']
+                        netto = tax_result['net_amount']
+                        tax_breakdown = tax_result['breakdown']
+                    else:
+                        tax = 0
+                        netto = dividend['bruto_amount']
+                        tax_breakdown = []
 
                     with st.container():
                         col_name, col_received, col_tax = st.columns([2, 1, 1])
 
                         with col_name:
                             st.write(f"**{dividend['name'] if pd.notna(dividend['name']) else dividend['ticker']}** ({dividend['ticker']})")
+                            # Toon tax info
+                            tax_info = tax_calc.get_tax_info_for_stock(dividend['ticker'], broker)
+                            if tax_info and not tax_info.startswith("⚠️"):
+                                st.caption(tax_info)
 
                         with col_received:
                             # Only show checkbox for past/today dividends
@@ -893,9 +1160,76 @@ with tab2:
                         with col1:
                             st.metric("Bruto", format_currency(dividend['bruto_amount'], currency))
                         with col2:
-                            st.metric("Tax (30%)", format_currency(tax, currency) if tax_paid else "Geen tax")
+                            if tax_paid and tax_breakdown:
+                                # Toon tax breakdown met expander
+                                st.metric("Tax", format_currency(tax, currency))
+                                with st.expander("📋 Tax breakdown"):
+                                    for line in tax_breakdown:
+                                        st.write(line)
+                            else:
+                                st.metric("Tax", "Geen tax" if not tax_paid else format_currency(tax, currency))
                         with col3:
                             st.metric("Netto", format_currency(netto, currency))
+
+                        # Tax details editor (alleen voor ontvangen dividenden)
+                        if not is_future and bool(dividend.get('received', 0)):
+                            with st.expander("⚙️ Tax Details (Manual Override)", expanded=False):
+                                st.caption("Vul deze velden in als je de exacte tax bedragen weet (bijv. van je broker statement). Laat leeg voor automatische berekening.")
+
+                                current_withheld = dividend.get('withheld_amount', 0) or 0
+                                current_additional = dividend.get('additional_tax_due', 0) or 0
+                                current_net = dividend.get('net_received')
+
+                                col_w, col_a, col_n = st.columns(3)
+
+                                with col_w:
+                                    new_withheld = st.number_input(
+                                        "Al ingehouden tax",
+                                        min_value=0.0,
+                                        value=float(current_withheld),
+                                        step=0.01,
+                                        format="%.2f",
+                                        key=f"withheld_{dividend['id']}_{selected_day}",
+                                        help="Bedrag dat al is ingehouden door broker/uitkerende instelling"
+                                    )
+
+                                with col_a:
+                                    new_additional = st.number_input(
+                                        "Nog te betalen tax",
+                                        min_value=0.0,
+                                        value=float(current_additional),
+                                        step=0.01,
+                                        format="%.2f",
+                                        key=f"additional_{dividend['id']}_{selected_day}",
+                                        help="Extra belasting die je nog moet betalen via aangifte"
+                                    )
+
+                                with col_n:
+                                    new_net = st.number_input(
+                                        "Netto ontvangen",
+                                        min_value=0.0,
+                                        value=float(current_net) if current_net else float(dividend['bruto_amount'] - new_withheld - new_additional),
+                                        step=0.01,
+                                        format="%.2f",
+                                        key=f"net_{dividend['id']}_{selected_day}",
+                                        help="Bedrag dat je daadwerkelijk hebt ontvangen"
+                                    )
+
+                                # Auto-calculate totale tax
+                                total_tax_manual = new_withheld + new_additional
+                                effective_rate = (total_tax_manual / dividend['bruto_amount'] * 100) if dividend['bruto_amount'] > 0 else 0
+
+                                st.caption(f"💡 Totale tax: €{total_tax_manual:.2f} ({effective_rate:.2f}%)")
+
+                                if st.button("💾 Opslaan Tax Details", key=f"save_tax_{dividend['id']}_{selected_day}"):
+                                    update_dividend_tax_details(
+                                        dividend['id'],
+                                        new_withheld,
+                                        new_additional,
+                                        new_net
+                                    )
+                                    st.success("✓ Tax details opgeslagen!")
+                                    st.rerun()
 
                         if pd.notna(dividend['notes']) and dividend['notes']:
                             st.info(f"📝 {dividend['notes']}")
@@ -915,8 +1249,11 @@ with tab2:
 
                 with st.expander(f"📅 {day} {calendar.month_name[selected_month]} - {len(day_data)} dividend(en)", expanded=False):
                     for _, row in day_data.iterrows():
-                        tax = row['bruto_amount'] * 0.30
-                        netto = row['bruto_amount'] - tax
+                        # Bereken tax intelligent
+                        broker = get_broker_for_ticker(row['ticker'])
+                        tax_result = tax_calc.calculate_tax(row['bruto_amount'], row['ticker'], broker)
+                        tax = tax_result['total_tax']
+                        netto = tax_result['net_amount']
 
                         st.write(f"**{row['name'] if pd.notna(row['name']) else row['ticker']}** ({row['ticker']})")
                         st.write(f"- Bruto: €{row['bruto_amount']:.2f} | Tax: €{tax:.2f} | Netto: €{netto:.2f}")
@@ -968,8 +1305,141 @@ with tab3:
         else:
             st.info("Niet genoeg historische data om voorspellingen te maken. Voeg minstens 2 dividenden per aandeel toe.")
 
-# Tab 4: Import Dividenden
+# Tab 4: Dividend Toevoegen
 with tab4:
+    st.subheader("➕ Dividend Handmatig Toevoegen")
+    st.info("Voeg een dividend toe met volledige tax details - ideaal voor dividenden die niet in Yahoo Finance staan of waarbij je exacte bedragen weet.")
+
+    # Haal portfolio aandelen op voor dropdown
+    portfolio_stocks_add = get_portfolio_stocks_with_isin()
+
+    with st.form("add_dividend_form"):
+        st.write("### Dividend Details")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if portfolio_stocks_add:
+                stock_options = ["Selecteer een aandeel..."] + [
+                    f"{stock['name']} ({stock['ticker']})" for stock in portfolio_stocks_add
+                ]
+                selected_stock_display = st.selectbox("Aandeel", stock_options)
+
+                # Extract ticker en andere info
+                if selected_stock_display != "Selecteer een aandeel...":
+                    selected_stock_obj = next(
+                        (s for s in portfolio_stocks_add if f"{s['name']} ({s['ticker']})" == selected_stock_display),
+                        None
+                    )
+                    default_ticker = selected_stock_obj['ticker'] if selected_stock_obj else ''
+                    default_isin = selected_stock_obj['isin'] if selected_stock_obj else ''
+                else:
+                    default_ticker = ''
+                    default_isin = ''
+            else:
+                st.warning("Geen aandelen in portfolio. Voeg eerst transacties toe.")
+                default_ticker = ''
+                default_isin = ''
+
+            ticker_input = st.text_input("Ticker", value=default_ticker, disabled=bool(default_ticker))
+            isin_input = st.text_input("ISIN", value=default_isin, disabled=bool(default_isin))
+            ex_date_input = st.date_input("Ex-Dividend Datum")
+
+        with col2:
+            bruto_amount_input = st.number_input(
+                "Bruto Bedrag (€)",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Het totale bruto dividend bedrag"
+            )
+            currency_input = st.selectbox("Valuta", ["EUR", "USD", "GBP"], index=0)
+            received_input = st.checkbox("✅ Dividend ontvangen", value=True)
+            tax_paid_input = st.checkbox("💰 Belasting betaald", value=True, disabled=not received_input)
+
+        st.divider()
+        st.write("### Tax Details (Optioneel)")
+        st.caption("Vul deze velden in als je exacte tax bedragen weet (van je broker statement). Anders laat leeg voor automatische berekening.")
+
+        col3, col4, col5 = st.columns(3)
+
+        with col3:
+            withheld_input = st.number_input(
+                "Al ingehouden tax (€)",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Bedrag dat al is ingehouden door broker/uitkerende instelling"
+            )
+
+        with col4:
+            additional_tax_input = st.number_input(
+                "Nog te betalen tax (€)",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Extra belasting die je nog moet betalen via aangifte"
+            )
+
+        with col5:
+            # Auto-calculate netto als tax waarden zijn ingevuld
+            if withheld_input > 0 or additional_tax_input > 0:
+                default_net = bruto_amount_input - withheld_input - additional_tax_input
+            else:
+                default_net = 0.0
+
+            net_received_input = st.number_input(
+                "Netto ontvangen (€)",
+                min_value=0.0,
+                value=default_net,
+                step=0.01,
+                format="%.2f",
+                help="Bedrag dat je daadwerkelijk hebt ontvangen"
+            )
+
+        # Tax preview
+        if withheld_input > 0 or additional_tax_input > 0:
+            total_tax = withheld_input + additional_tax_input
+            effective_rate = (total_tax / bruto_amount_input * 100) if bruto_amount_input > 0 else 0
+            st.info(f"💡 Totale tax: €{total_tax:.2f} ({effective_rate:.2f}%) | Netto: €{net_received_input:.2f}")
+
+        notes_input = st.text_area("Notities (optioneel)", height=80)
+
+        submit_dividend = st.form_submit_button("💾 Dividend Opslaan", type="primary")
+
+    if submit_dividend:
+        # Validatie
+        if not ticker_input or not isin_input:
+            st.error("Selecteer een aandeel of vul ticker en ISIN in.")
+        elif bruto_amount_input <= 0:
+            st.error("Bruto bedrag moet groter zijn dan 0.")
+        else:
+            # Als er geen tax details zijn ingevuld, zet net_received op None
+            final_net_received = net_received_input if (withheld_input > 0 or additional_tax_input > 0 or net_received_input > 0) else None
+
+            # Voeg dividend toe
+            insert_dividend(
+                ticker=ticker_input,
+                isin=isin_input,
+                ex_date=ex_date_input.isoformat(),
+                bruto_amount=bruto_amount_input,
+                currency=currency_input,
+                notes=notes_input,
+                received=received_input,
+                tax_paid=tax_paid_input if received_input else False,
+                withheld_amount=withheld_input,
+                additional_tax_due=additional_tax_input,
+                net_received=final_net_received
+            )
+
+            st.success(f"✓ Dividend toegevoegd voor {ticker_input} op {ex_date_input.strftime('%Y-%m-%d')}")
+            st.info("💡 Bekijk het dividend in de Overzicht of Kalender View tabs")
+            st.rerun()
+
+# Tab 5: Import Dividenden
+with tab5:
     st.subheader("⬇️ Dividend Geschiedenis Importeren")
     st.info("📡 Haal dividend data op van Yahoo Finance (gratis & betrouwbaar). De data wordt eerst in een buffer opgeslagen zodat je deze kan controleren voordat je importeert.")
 

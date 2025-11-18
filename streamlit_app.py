@@ -152,6 +152,16 @@ def load_transactions():
     return df
 
 
+def get_available_brokers():
+    """Haalt alle geconfigureerde brokers op."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT broker_name FROM broker_settings ORDER BY broker_name")
+    brokers = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return brokers
+
+
 # --------- ISIN Lookup ---------
 def lookup_isin(isin_code):
     """
@@ -292,7 +302,30 @@ with st.form(form_key):
 
     with col1:
         date = st.date_input("Datum")
-        broker = st.text_input("Broker (bv. DEGIRO)")
+
+        # Broker dropdown met optie voor custom input
+        available_brokers = get_available_brokers()
+
+        if available_brokers:
+            # Voeg "Andere..." optie toe
+            broker_options = available_brokers + ["➕ Andere (nieuwe broker toevoegen)"]
+            broker_selection = st.selectbox(
+                "Broker",
+                broker_options,
+                help="Selecteer een geconfigureerde broker of voeg een nieuwe toe"
+            )
+
+            # Als "Andere..." geselecteerd, toon text input
+            if broker_selection == "➕ Andere (nieuwe broker toevoegen)":
+                broker = st.text_input("Nieuwe broker naam", placeholder="Bv. DEGIRO, Interactive Brokers")
+                st.info("💡 Tip: Configureer deze broker in Broker Settings voor W-8BEN tracking")
+            else:
+                broker = broker_selection
+        else:
+            # Geen brokers geconfigureerd - fallback naar text input
+            broker = st.text_input("Broker (bv. DEGIRO)")
+            st.warning("⚠️ Geen brokers geconfigureerd. Ga naar Broker Settings om brokers toe te voegen.")
+
         transaction_type = st.selectbox("Type", ["BUY", "SELL"])
         name = st.text_input(
             "Naam aandeel",

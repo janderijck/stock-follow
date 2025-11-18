@@ -5,6 +5,11 @@ import yfinance as yf
 import requests
 from pathlib import Path
 from datetime import datetime
+import sys
+
+# Add parent directory to path for imports
+sys.path.append(str(Path(__file__).parent.parent))
+from tax_calculator import TaxCalculator
 
 DB_PATH = Path("data.db")
 OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
@@ -140,7 +145,8 @@ def get_manual_dividends(ticker):
     conn = get_connection()
     df = pd.read_sql_query(
         """
-        SELECT id, ex_date, bruto_amount, notes, currency, tax_paid, received
+        SELECT id, ex_date, bruto_amount, notes, currency, tax_paid, received,
+               withheld_amount, additional_tax_due, net_received
         FROM dividends
         WHERE ticker = ?
         ORDER BY ex_date DESC
@@ -159,6 +165,25 @@ def delete_dividend(dividend_id):
     cur.execute("DELETE FROM dividends WHERE id = ?", (dividend_id,))
     conn.commit()
     conn.close()
+
+
+def get_broker_for_ticker(ticker):
+    """Haal de meest recente broker op voor een ticker."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT broker
+        FROM transactions
+        WHERE ticker = ?
+        ORDER BY date DESC
+        LIMIT 1
+    """, (ticker,))
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return result[0] if result else None
 
 
 def calculate_total_dividends(ticker):
@@ -186,11 +211,32 @@ def calculate_total_dividends(ticker):
             'received_count': 0
         }
 
-    TAX_RATE = 0.30
+    # Use intelligent tax calculator
+    tax_calc = TaxCalculator()
     total_bruto = received_df['bruto_amount'].sum()
-    # Only calculate tax for dividends where tax was actually paid
-    total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in received_df.iterrows() if row.get('tax_paid', 1))
-    total_netto = total_bruto - total_tax
+    total_tax = 0
+    total_netto = 0
+
+    for _, row in received_df.iterrows():
+        if row.get('tax_paid', 1):
+            # Check voor handmatige tax waarden
+            withheld = row.get('withheld_amount', 0) or 0
+            additional_tax = row.get('additional_tax_due', 0) or 0
+            net_received_manual = row.get('net_received')
+
+            if withheld > 0 or additional_tax > 0 or net_received_manual:
+                # Gebruik handmatige waarden
+                total_tax += (withheld + additional_tax)
+                total_netto += (net_received_manual if net_received_manual else (row['bruto_amount'] - withheld - additional_tax))
+            else:
+                # Gebruik automatische calculator
+                broker = get_broker_for_ticker(ticker)
+                tax_result = tax_calc.calculate_tax(row['bruto_amount'], ticker, broker)
+                total_tax += tax_result['total_tax']
+                total_netto += tax_result['net_amount']
+        else:
+            # Geen tax betaald
+            total_netto += row['bruto_amount']
 
     return {
         'total_bruto': total_bruto,
@@ -647,9 +693,9 @@ if selected_ticker:
                     key=f"div_received_{selected_ticker}"
                 )
                 div_tax_paid = st.checkbox(
-                    "💰 Tax betaald (30%)",
+                    "💰 Tax betaald",
                     value=False,
-                    help="Vink aan als je roerende voorheffing (30%) betaald hebt op dit dividend (⚠️ Kan alleen als dividend ontvangen is)",
+                    help="Vink aan als je belasting betaald hebt op dit dividend (⚠️ Kan alleen als dividend ontvangen is). Tax bedrag wordt automatisch berekend op basis van asset type en broker.",
                     key=f"div_tax_{selected_ticker}"
                 )
 
@@ -683,9 +729,10 @@ if selected_ticker:
     if not dividends_df.empty:
         st.write("#### Ontvangen Dividenden")
 
-        # Bereken totalen
+        # Bereken totalen met intelligente tax calculator
         div_info = calculate_total_dividends(selected_ticker)
-        TAX_RATE = 0.30
+        tax_calc = TaxCalculator()
+        broker = get_broker_for_ticker(selected_ticker)
 
         # Maak tabel met actie knoppen
         div_table_data = []
@@ -695,15 +742,42 @@ if selected_ticker:
             tax_paid = row.get('tax_paid', 1)
             received = row.get('received', 0)
 
-            tax = (bruto * TAX_RATE) if tax_paid else 0
-            netto = bruto - tax
+            # Check voor handmatige tax waarden
+            withheld = row.get('withheld_amount', 0) or 0
+            additional_tax = row.get('additional_tax_due', 0) or 0
+            net_received_manual = row.get('net_received')
+
+            # Bereken tax intelligent
+            if tax_paid:
+                if withheld > 0 or additional_tax > 0 or net_received_manual:
+                    # Gebruik handmatige waarden
+                    tax = withheld + additional_tax
+                    netto = net_received_manual if net_received_manual else (bruto - tax)
+                    tax_label = 'Tax (Manual)'
+                else:
+                    # Gebruik automatische calculator
+                    tax_result = tax_calc.calculate_tax(bruto, selected_ticker, broker)
+                    tax = tax_result['total_tax']
+                    netto = tax_result['net_amount']
+                    # Bepaal tax label
+                    stock_info = tax_calc.get_stock_info(selected_ticker)
+                    if stock_info and stock_info['asset_type'] == 'REIT':
+                        tax_label = 'Tax (REIT)'
+                    elif stock_info and stock_info['country'] == 'Verenigde Staten':
+                        tax_label = 'Tax (US+BE)'
+                    else:
+                        tax_label = 'Tax'
+            else:
+                tax = 0
+                netto = bruto
+                tax_label = 'Tax'
 
             div_table_data.append({
                 'ID': row['id'],
                 'Ex-Dividend Datum': row['ex_date'],
                 'Currency': currency,
                 'Bruto': format_currency(bruto, currency),
-                'Tax (30%)': format_currency(tax, currency) if tax_paid else '-',
+                tax_label: format_currency(tax, currency) if tax_paid else '-',
                 'Netto': format_currency(netto, currency),
                 'Tax betaald': "✅" if tax_paid else "❌",
                 'Ontvangen': "✅" if received else "❌",
@@ -712,9 +786,12 @@ if selected_ticker:
 
         div_display_df = pd.DataFrame(div_table_data)
 
+        # Bepaal welke tax kolom te tonen (eerste niet-standaard kolom of "Tax")
+        tax_column = next((col for col in div_display_df.columns if 'Tax' in col and col not in ['Tax betaald']), 'Tax')
+
         # Toon tabel (zonder ID kolom in display)
         st.dataframe(
-            div_display_df[['Ex-Dividend Datum', 'Currency', 'Bruto', 'Tax (30%)', 'Netto', 'Tax betaald', 'Ontvangen', 'Notities']],
+            div_display_df[['Ex-Dividend Datum', 'Currency', 'Bruto', tax_column, 'Netto', 'Tax betaald', 'Ontvangen', 'Notities']],
             use_container_width=True,
             hide_index=True
         )
@@ -741,7 +818,7 @@ if selected_ticker:
             st.metric("Totaal Bruto (ontvangen)", f"€{div_info['total_bruto']:.2f}")
 
         with col2:
-            st.metric("Roerende Voorheffing (30%)", f"€{div_info['total_tax']:.2f}", delta=None, delta_color="off")
+            st.metric("Totaal Tax Betaald", f"€{div_info['total_tax']:.2f}", delta=None, delta_color="off")
 
         with col3:
             st.metric("Totaal Netto (ontvangen)", f"€{div_info['total_netto']:.2f}", delta=f"+{div_info['total_netto']:.2f}")
