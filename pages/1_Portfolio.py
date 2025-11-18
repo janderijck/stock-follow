@@ -2,10 +2,12 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import yfinance as yf
+import requests
 from pathlib import Path
 from datetime import datetime
 
 DB_PATH = Path("data.db")
+OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
 
 st.set_page_config(page_title="Portfolio Overzicht", page_icon="📊", layout="wide")
 
@@ -52,33 +54,113 @@ def get_portfolio_holdings():
     return df
 
 
-def get_current_price(ticker):
+def get_yahoo_ticker_from_isin(isin):
+    """
+    Haalt de correcte Yahoo Finance ticker op via ISIN lookup in OpenFIGI.
+    Retourneert ticker met exchange suffix (bv. KBC.BR voor Brussels).
+    """
+    if not isin:
+        return None
+
+    try:
+        headers = {'Content-Type': 'application/json'}
+        jobs = [{'idType': 'ID_ISIN', 'idValue': isin.strip().upper()}]
+
+        response = requests.post(
+            url=OPENFIGI_URL,
+            headers=headers,
+            json=jobs,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+
+        if not data or len(data) == 0:
+            return None
+
+        first_result = data[0]
+
+        if 'data' in first_result and len(first_result['data']) > 0:
+            # Zoek naar een match met compositeFIGI (meest betrouwbaar voor yahoo)
+            for security in first_result['data']:
+                ticker = security.get('ticker', '')
+                exchange_code = security.get('exchCode', '')
+
+                # Map exchange codes naar Yahoo Finance suffixes
+                exchange_suffix_map = {
+                    'BB': '.BR',  # Brussels
+                    'AS': '.AS',  # Amsterdam
+                    'PA': '.PA',  # Paris
+                    'MI': '.MI',  # Milan
+                    'MC': '.MC',  # Madrid
+                    'LS': '.L',   # London
+                    'SW': '.SW',  # Swiss
+                    'GY': '.DE',  # Germany (Xetra)
+                    'GR': '.DE',  # Germany
+                    'US': '',     # US - geen suffix nodig
+                }
+
+                suffix = exchange_suffix_map.get(exchange_code, '')
+                if ticker:
+                    return f"{ticker}{suffix}"
+
+        return None
+
+    except Exception:
+        # Silently fail - we'll fall back to the original ticker
+        return None
+
+
+def get_current_price(ticker, isin=None):
     """
     Haalt de huidige prijs op voor een ticker via yfinance API.
+    Als ISIN gegeven is, wordt eerst de juiste Yahoo ticker bepaald.
     Retourneert dict met current_price, change_percent, currency.
     """
     if not ticker:
         return None
 
+    # Probeer eerst de juiste ticker te krijgen via ISIN als deze beschikbaar is
+    yahoo_ticker = ticker
+    if isin:
+        isin_ticker = get_yahoo_ticker_from_isin(isin)
+        if isin_ticker:
+            yahoo_ticker = isin_ticker
+
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(yahoo_ticker)
+
+        # Probeer eerst via history (meest betrouwbaar)
+        hist = stock.history(period='5d')
+        if not hist.empty:
+            current_price = hist['Close'].iloc[-1]
+
+            # Bereken dagelijkse verandering
+            if len(hist) > 1:
+                prev_close = hist['Close'].iloc[-2]
+                change_percent = ((current_price - prev_close) / prev_close) * 100
+            else:
+                change_percent = 0
+
+            return {
+                'current_price': float(current_price),
+                'change_percent': float(change_percent),
+                'currency': 'EUR',  # Default to EUR for European stocks
+                'name': ticker
+            }
+
+        # Fallback naar info als history niet werkt
         info = stock.info
-
-        # Probeer verschillende velden voor de huidige prijs
         current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-
-        if current_price is None:
-            # Probeer via history als info niet werkt
-            hist = stock.history(period='1d')
-            if not hist.empty:
-                current_price = hist['Close'].iloc[-1]
 
         if current_price is None:
             return {"error": "Geen prijs beschikbaar"}
 
-        # Haal percentage verandering op (vandaag)
         change_percent = info.get('regularMarketChangePercent', 0)
-        currency = info.get('currency', 'USD')
+        currency = info.get('currency', 'EUR')
 
         return {
             'current_price': float(current_price),
@@ -129,9 +211,10 @@ portfolio_data = []
 with st.spinner("Huidige prijzen ophalen..."):
     for idx, row in holdings.iterrows():
         ticker = row['ticker']
+        isin = row['isin']
 
-        # Haal huidige prijs op
-        price_info = get_current_price(ticker)
+        # Haal huidige prijs op (met ISIN voor juiste ticker lookup)
+        price_info = get_current_price(ticker, isin)
 
         if price_info and 'error' not in price_info:
             current_price = price_info['current_price']
