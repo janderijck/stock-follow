@@ -657,34 +657,35 @@ with tab1:
         display_df = pd.DataFrame(display_data)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        # Statistieken
+        # Statistieken - ALLEEN voor ontvangen dividenden
         st.divider()
+        st.write("### 📊 Ontvangen Dividenden Statistieken")
         col1, col2, col3, col4 = st.columns(4)
 
-        total_bruto = filtered_df['bruto_amount'].sum()
-        # Calculate tax only for dividends where tax was actually paid
-        total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in filtered_df.iterrows() if row.get('tax_paid', 1))
-        total_netto = total_bruto - total_tax
-
-        # Calculate received vs not received
+        # Filter alleen ontvangen dividenden
         received_df = filtered_df[filtered_df['received'] == 1]
-        received_netto = 0
+
         if not received_df.empty:
-            for _, row in received_df.iterrows():
-                tax = (row['bruto_amount'] * TAX_RATE) if row.get('tax_paid', 1) else 0
-                received_netto += (row['bruto_amount'] - tax)
+            total_bruto = received_df['bruto_amount'].sum()
+            # Calculate tax only for dividends where tax was actually paid
+            total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in received_df.iterrows() if row.get('tax_paid', 1))
+            total_netto = total_bruto - total_tax
+        else:
+            total_bruto = 0
+            total_tax = 0
+            total_netto = 0
 
         with col1:
-            st.metric("Totaal Bruto", f"€{total_bruto:.2f}")
+            st.metric("Totaal Bruto (ontvangen)", f"€{total_bruto:.2f}")
 
         with col2:
             st.metric("Totaal Tax betaald", f"€{total_tax:.2f}")
 
         with col3:
-            st.metric("Totaal Netto", f"€{total_netto:.2f}")
+            st.metric("Totaal Netto (ontvangen)", f"€{total_netto:.2f}")
 
         with col4:
-            st.metric("Ontvangen (netto)", f"€{received_netto:.2f}", delta=f"{len(received_df)}/{len(filtered_df)}")
+            st.metric("Aantal ontvangen", f"{len(received_df)}/{len(filtered_df)}")
 
 # Tab 2: Kalender View
 with tab2:
@@ -857,25 +858,36 @@ with tab2:
                                 # Update if changed
                                 if received_checkbox != current_received:
                                     update_dividend_received_status(dividend['id'], received_checkbox)
+                                    # Als ontvangen wordt uitgezet, zet tax_paid ook uit
+                                    if not received_checkbox:
+                                        update_dividend_tax_paid_status(dividend['id'], False)
                                     st.success("✓ Status bijgewerkt")
                                     st.rerun()
                             else:
                                 st.info("🔮 Toekomstig")
 
                         with col_tax:
-                            # Tax paid checkbox
-                            current_tax_paid = bool(dividend.get('tax_paid', 1))
-                            tax_paid_checkbox = st.checkbox(
-                                "💰 Tax betaald",
-                                value=current_tax_paid,
-                                key=f"tax_{dividend['id']}_{selected_year}_{selected_month}_{selected_day}"
-                            )
+                            # Tax paid checkbox - alleen enabled als ontvangen is aangevinkt
+                            if not is_future:
+                                current_received = bool(dividend.get('received', 0))
+                                current_tax_paid = bool(dividend.get('tax_paid', 1))
 
-                            # Update if changed
-                            if tax_paid_checkbox != current_tax_paid:
-                                update_dividend_tax_paid_status(dividend['id'], tax_paid_checkbox)
-                                st.success("✓ Tax status bijgewerkt")
-                                st.rerun()
+                                # Disable tax checkbox als niet ontvangen
+                                tax_paid_checkbox = st.checkbox(
+                                    "💰 Tax betaald",
+                                    value=current_tax_paid if current_received else False,
+                                    disabled=not current_received,
+                                    key=f"tax_{dividend['id']}_{selected_year}_{selected_month}_{selected_day}",
+                                    help="Kan alleen aangevinkt worden als dividend ontvangen is"
+                                )
+
+                                # Update if changed (alleen als ontvangen is aangevinkt)
+                                if current_received and tax_paid_checkbox != current_tax_paid:
+                                    update_dividend_tax_paid_status(dividend['id'], tax_paid_checkbox)
+                                    st.success("✓ Tax status bijgewerkt")
+                                    st.rerun()
+                            else:
+                                st.info("🔮 Toekomstig")
 
                         col1, col2, col3 = st.columns(3)
                         with col1:

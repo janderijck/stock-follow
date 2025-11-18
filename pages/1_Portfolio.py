@@ -94,7 +94,7 @@ def delete_dividend(dividend_id):
 
 
 def calculate_total_dividends(ticker):
-    """Berekent totaal ontvangen dividend (bruto en netto) voor een ticker."""
+    """Berekent totaal ontvangen dividend (bruto en netto) voor een ticker - ALLEEN ontvangen dividenden."""
     df = get_manual_dividends(ticker)
 
     if df.empty:
@@ -102,20 +102,34 @@ def calculate_total_dividends(ticker):
             'total_bruto': 0,
             'total_tax': 0,
             'total_netto': 0,
-            'count': 0
+            'count': 0,
+            'received_count': 0
+        }
+
+    # Filter alleen ontvangen dividenden
+    received_df = df[df['received'] == 1]
+
+    if received_df.empty:
+        return {
+            'total_bruto': 0,
+            'total_tax': 0,
+            'total_netto': 0,
+            'count': len(df),
+            'received_count': 0
         }
 
     TAX_RATE = 0.30
-    total_bruto = df['bruto_amount'].sum()
+    total_bruto = received_df['bruto_amount'].sum()
     # Only calculate tax for dividends where tax was actually paid
-    total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in df.iterrows() if row.get('tax_paid', 1))
+    total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in received_df.iterrows() if row.get('tax_paid', 1))
     total_netto = total_bruto - total_tax
 
     return {
         'total_bruto': total_bruto,
         'total_tax': total_tax,
         'total_netto': total_netto,
-        'count': len(df)
+        'count': len(df),
+        'received_count': len(received_df)
     }
 
 
@@ -493,14 +507,8 @@ if selected_ticker:
             with col2:
                 div_notes = st.text_area(
                     "Notities (optioneel)",
-                    height=60,
+                    height=40,
                     key=f"div_notes_{selected_ticker}"
-                )
-                div_tax_paid = st.checkbox(
-                    "💰 Tax betaald (30%)",
-                    value=True,
-                    help="Vink aan als je roerende voorheffing (30%) betaald hebt op dit dividend",
-                    key=f"div_tax_{selected_ticker}"
                 )
                 div_received = st.checkbox(
                     "✅ Ontvangen",
@@ -508,10 +516,24 @@ if selected_ticker:
                     help="Vink aan als je dit dividend al ontvangen hebt",
                     key=f"div_received_{selected_ticker}"
                 )
+                div_tax_paid = st.checkbox(
+                    "💰 Tax betaald (30%)",
+                    value=False,
+                    help="Vink aan als je roerende voorheffing (30%) betaald hebt op dit dividend (⚠️ Kan alleen als dividend ontvangen is)",
+                    key=f"div_tax_{selected_ticker}"
+                )
+
+            st.info("ℹ️ Tax kan alleen betaald zijn als dividend ontvangen is")
 
             div_submitted = st.form_submit_button("💾 Dividend opslaan")
 
             if div_submitted and div_amount > 0:
+                # Logica: tax_paid kan alleen true zijn als received ook true is
+                final_tax_paid = div_tax_paid and div_received
+
+                if div_tax_paid and not div_received:
+                    st.warning("⚠️ Tax betaald is uitgezet omdat dividend nog niet ontvangen is")
+
                 add_dividend(
                     selected_ticker,
                     selected_data['ISIN'],
@@ -519,7 +541,7 @@ if selected_ticker:
                     div_amount,
                     div_notes,
                     div_currency,
-                    div_tax_paid,
+                    final_tax_paid,
                     div_received
                 )
                 st.success(f"✓ Dividend van {format_currency(div_amount, div_currency)} toegevoegd!")
@@ -580,21 +602,22 @@ if selected_ticker:
                 st.success("Dividend verwijderd!")
                 st.rerun()
 
-        # Toon totalen
+        # Toon totalen - ALLEEN ontvangen dividenden
         st.divider()
+        st.write(f"### 📊 Ontvangen Dividenden ({div_info['received_count']}/{div_info['count']})")
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.metric("Totaal Bruto Dividend", f"€{div_info['total_bruto']:.2f}")
+            st.metric("Totaal Bruto (ontvangen)", f"€{div_info['total_bruto']:.2f}")
 
         with col2:
             st.metric("Roerende Voorheffing (30%)", f"€{div_info['total_tax']:.2f}", delta=None, delta_color="off")
 
         with col3:
-            st.metric("Totaal Netto Dividend", f"€{div_info['total_netto']:.2f}", delta=f"+{div_info['total_netto']:.2f}")
+            st.metric("Totaal Netto (ontvangen)", f"€{div_info['total_netto']:.2f}", delta=f"+{div_info['total_netto']:.2f}")
 
         # Toon impact op totale performance
-        if '_perf' in selected_data:
+        if '_perf' in selected_data and div_info['total_netto'] > 0:
             st.info(f"💡 Je totale winst/verlies (inclusief €{div_info['total_netto']:.2f} netto dividend) is: **€{selected_data['_perf']['total_gain_loss']:.2f}** ({selected_data['_perf']['gain_loss_percent']:+.2f}%)")
     else:
         st.info("Nog geen dividenden toegevoegd. Gebruik het formulier hierboven om dividenden toe te voegen.")
