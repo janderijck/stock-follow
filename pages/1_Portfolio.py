@@ -32,16 +32,36 @@ def get_connection():
     return conn
 
 
-def add_dividend(ticker, isin, ex_date, bruto_amount, notes=""):
+def format_currency(amount, currency='EUR'):
+    """Format een bedrag met het juiste currency symbool."""
+    currency_symbols = {
+        'USD': '$',
+        'EUR': '€',
+        'GBP': '£',
+        'JPY': '¥',
+        'CHF': 'CHF ',
+        'CAD': 'C$',
+        'AUD': 'A$',
+    }
+
+    symbol = currency_symbols.get(currency, currency + ' ')
+
+    if currency == 'EUR':
+        return f"€{amount:.2f}"
+    else:
+        return f"{symbol}{amount:.2f}"
+
+
+def add_dividend(ticker, isin, ex_date, bruto_amount, notes="", currency="EUR", tax_paid=True, received=False):
     """Voegt een handmatig ingevoerd dividend toe."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes, currency, tax_paid, received)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (ticker, isin, ex_date.isoformat(), float(bruto_amount), notes)
+        (ticker, isin, ex_date.isoformat(), float(bruto_amount), notes, currency, 1 if tax_paid else 0, 1 if received else 0)
     )
     conn.commit()
     conn.close()
@@ -52,7 +72,7 @@ def get_manual_dividends(ticker):
     conn = get_connection()
     df = pd.read_sql_query(
         """
-        SELECT id, ex_date, bruto_amount, notes
+        SELECT id, ex_date, bruto_amount, notes, currency, tax_paid, received
         FROM dividends
         WHERE ticker = ?
         ORDER BY ex_date DESC
@@ -87,7 +107,8 @@ def calculate_total_dividends(ticker):
 
     TAX_RATE = 0.30
     total_bruto = df['bruto_amount'].sum()
-    total_tax = total_bruto * TAX_RATE
+    # Only calculate tax for dividends where tax was actually paid
+    total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in df.iterrows() if row.get('tax_paid', 1))
     total_netto = total_bruto - total_tax
 
     return {
@@ -455,19 +476,37 @@ if selected_ticker:
             with col1:
                 div_date = st.date_input("Ex-Dividend Datum", key=f"div_date_{selected_ticker}")
                 div_amount = st.number_input(
-                    "Bruto bedrag (€)",
+                    "Bruto bedrag",
                     min_value=0.0,
                     step=0.01,
                     format="%.2f",
                     help="Voer het totale bruto dividend in (voor al je aandelen)",
                     key=f"div_amount_{selected_ticker}"
                 )
+                div_currency = st.selectbox(
+                    "Currency",
+                    options=["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"],
+                    index=0,
+                    key=f"div_currency_{selected_ticker}"
+                )
 
             with col2:
                 div_notes = st.text_area(
                     "Notities (optioneel)",
-                    height=100,
+                    height=60,
                     key=f"div_notes_{selected_ticker}"
+                )
+                div_tax_paid = st.checkbox(
+                    "💰 Tax betaald (30%)",
+                    value=True,
+                    help="Vink aan als je roerende voorheffing (30%) betaald hebt op dit dividend",
+                    key=f"div_tax_{selected_ticker}"
+                )
+                div_received = st.checkbox(
+                    "✅ Ontvangen",
+                    value=False,
+                    help="Vink aan als je dit dividend al ontvangen hebt",
+                    key=f"div_received_{selected_ticker}"
                 )
 
             div_submitted = st.form_submit_button("💾 Dividend opslaan")
@@ -478,9 +517,12 @@ if selected_ticker:
                     selected_data['ISIN'],
                     div_date,
                     div_amount,
-                    div_notes
+                    div_notes,
+                    div_currency,
+                    div_tax_paid,
+                    div_received
                 )
-                st.success(f"✓ Dividend van €{div_amount:.2f} toegevoegd!")
+                st.success(f"✓ Dividend van {format_currency(div_amount, div_currency)} toegevoegd!")
                 st.rerun()
 
     # Haal bestaande dividenden op
@@ -497,15 +539,22 @@ if selected_ticker:
         div_table_data = []
         for _, row in dividends_df.iterrows():
             bruto = row['bruto_amount']
-            tax = bruto * TAX_RATE
+            currency = row.get('currency', 'EUR')
+            tax_paid = row.get('tax_paid', 1)
+            received = row.get('received', 0)
+
+            tax = (bruto * TAX_RATE) if tax_paid else 0
             netto = bruto - tax
 
             div_table_data.append({
                 'ID': row['id'],
                 'Ex-Dividend Datum': row['ex_date'],
-                'Bruto': f"€{bruto:.2f}",
-                'Tax (30%)': f"€{tax:.2f}",
-                'Netto': f"€{netto:.2f}",
+                'Currency': currency,
+                'Bruto': format_currency(bruto, currency),
+                'Tax (30%)': format_currency(tax, currency) if tax_paid else '-',
+                'Netto': format_currency(netto, currency),
+                'Tax betaald': "✅" if tax_paid else "❌",
+                'Ontvangen': "✅" if received else "❌",
                 'Notities': row['notes'] if row['notes'] else '-'
             })
 
@@ -513,7 +562,7 @@ if selected_ticker:
 
         # Toon tabel (zonder ID kolom in display)
         st.dataframe(
-            div_display_df[['Ex-Dividend Datum', 'Bruto', 'Tax (30%)', 'Netto', 'Notities']],
+            div_display_df[['Ex-Dividend Datum', 'Currency', 'Bruto', 'Tax (30%)', 'Netto', 'Tax betaald', 'Ontvangen', 'Notities']],
             use_container_width=True,
             hide_index=True
         )

@@ -51,6 +51,10 @@ def get_connection():
         cursor.execute("ALTER TABLE dividends ADD COLUMN currency TEXT DEFAULT 'USD'")
         conn.commit()
 
+    if 'tax_paid' not in columns:
+        cursor.execute("ALTER TABLE dividends ADD COLUMN tax_paid INTEGER DEFAULT 1")
+        conn.commit()
+
     # Migratie: Voeg 'currency' kolom toe aan dividend_cache als deze nog niet bestaat
     cursor.execute("PRAGMA table_info(dividend_cache)")
     cache_columns = [col[1] for col in cursor.fetchall()]
@@ -106,6 +110,18 @@ def update_dividend_received_status(dividend_id, received):
     conn.close()
 
 
+def update_dividend_tax_paid_status(dividend_id, tax_paid):
+    """Update de tax_paid status van een dividend."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE dividends SET tax_paid = ? WHERE id = ?",
+        (1 if tax_paid else 0, dividend_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_all_dividends():
     """Haalt alle dividend uitkeringen op."""
     conn = get_connection()
@@ -120,6 +136,7 @@ def get_all_dividends():
             d.currency,
             d.notes,
             d.received,
+            d.tax_paid,
             t.name
         FROM dividends d
         LEFT JOIN (
@@ -613,7 +630,8 @@ with tab1:
 
         display_data = []
         for _, row in filtered_df.iterrows():
-            tax = row['bruto_amount'] * TAX_RATE
+            tax_paid = row.get('tax_paid', 1)
+            tax = (row['bruto_amount'] * TAX_RATE) if tax_paid else 0
             netto = row['bruto_amount'] - tax
             currency = row.get('currency', 'USD')
 
@@ -621,6 +639,7 @@ with tab1:
             ex_date = pd.to_datetime(row['ex_date'])
             is_future = ex_date > pd.Timestamp.now()
             received_status = "🔮 Toekomst" if is_future else ("✅ Ja" if row.get('received', 0) else "❌ Nee")
+            tax_status = "✅ Ja" if tax_paid else "❌ Nee"
 
             display_data.append({
                 'Ex-Dividend Datum': row['ex_date'].strftime('%Y-%m-%d'),
@@ -628,8 +647,9 @@ with tab1:
                 'Ticker': row['ticker'],
                 'Currency': currency,
                 'Bruto': format_currency(row['bruto_amount'], currency),
-                'Tax (30%)': format_currency(tax, currency),
+                'Tax (30%)': format_currency(tax, currency) if tax_paid else '-',
                 'Netto': format_currency(netto, currency),
+                'Tax betaald': tax_status,
                 'Ontvangen': received_status,
                 'Notities': row['notes'] if pd.notna(row['notes']) and row['notes'] else '-'
             })
@@ -642,18 +662,23 @@ with tab1:
         col1, col2, col3, col4 = st.columns(4)
 
         total_bruto = filtered_df['bruto_amount'].sum()
-        total_tax = total_bruto * TAX_RATE
+        # Calculate tax only for dividends where tax was actually paid
+        total_tax = sum(row['bruto_amount'] * TAX_RATE for _, row in filtered_df.iterrows() if row.get('tax_paid', 1))
         total_netto = total_bruto - total_tax
 
         # Calculate received vs not received
         received_df = filtered_df[filtered_df['received'] == 1]
-        received_netto = (received_df['bruto_amount'].sum() * (1 - TAX_RATE)) if not received_df.empty else 0
+        received_netto = 0
+        if not received_df.empty:
+            for _, row in received_df.iterrows():
+                tax = (row['bruto_amount'] * TAX_RATE) if row.get('tax_paid', 1) else 0
+                received_netto += (row['bruto_amount'] - tax)
 
         with col1:
             st.metric("Totaal Bruto", f"€{total_bruto:.2f}")
 
         with col2:
-            st.metric("Totaal Tax (30%)", f"€{total_tax:.2f}")
+            st.metric("Totaal Tax betaald", f"€{total_tax:.2f}")
 
         with col3:
             st.metric("Totaal Netto", f"€{total_netto:.2f}")
@@ -808,11 +833,13 @@ with tab2:
                     st.write(f"### 📋 Details voor {selected_day} {calendar.month_name[selected_month]} {selected_year} (Vandaag)")
 
                 for dividend in day_data:
-                    tax = dividend['bruto_amount'] * 0.30
+                    tax_paid = bool(dividend.get('tax_paid', 1))
+                    tax = (dividend['bruto_amount'] * 0.30) if tax_paid else 0
                     netto = dividend['bruto_amount'] - tax
+                    currency = dividend.get('currency', 'USD')
 
                     with st.container():
-                        col_name, col_received = st.columns([3, 1])
+                        col_name, col_received, col_tax = st.columns([2, 1, 1])
 
                         with col_name:
                             st.write(f"**{dividend['name'] if pd.notna(dividend['name']) else dividend['ticker']}** ({dividend['ticker']})")
@@ -835,13 +862,28 @@ with tab2:
                             else:
                                 st.info("🔮 Toekomstig")
 
+                        with col_tax:
+                            # Tax paid checkbox
+                            current_tax_paid = bool(dividend.get('tax_paid', 1))
+                            tax_paid_checkbox = st.checkbox(
+                                "💰 Tax betaald",
+                                value=current_tax_paid,
+                                key=f"tax_{dividend['id']}_{selected_year}_{selected_month}_{selected_day}"
+                            )
+
+                            # Update if changed
+                            if tax_paid_checkbox != current_tax_paid:
+                                update_dividend_tax_paid_status(dividend['id'], tax_paid_checkbox)
+                                st.success("✓ Tax status bijgewerkt")
+                                st.rerun()
+
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("Bruto", f"€{dividend['bruto_amount']:.2f}")
+                            st.metric("Bruto", format_currency(dividend['bruto_amount'], currency))
                         with col2:
-                            st.metric("Tax (30%)", f"€{tax:.2f}")
+                            st.metric("Tax (30%)", format_currency(tax, currency) if tax_paid else "Geen tax")
                         with col3:
-                            st.metric("Netto", f"€{netto:.2f}")
+                            st.metric("Netto", format_currency(netto, currency))
 
                         if pd.notna(dividend['notes']) and dividend['notes']:
                             st.info(f"📝 {dividend['notes']}")
