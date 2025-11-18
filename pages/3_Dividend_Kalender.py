@@ -566,7 +566,7 @@ with tab2:
         st.info("Nog geen dividend uitkeringen geregistreerd.")
     else:
         # Selecteer jaar en maand
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns([2, 2, 1])
 
         with col1:
             years = sorted(dividends_df['ex_date'].dt.year.unique().tolist(), reverse=True)
@@ -591,16 +591,103 @@ with tab2:
             (dividends_df['ex_date'].dt.month == selected_month)
         ]
 
+        st.divider()
+
         if month_filter.empty:
             st.info(f"Geen dividenden in {calendar.month_name[selected_month]} {selected_year}")
         else:
-            st.write(f"### {calendar.month_name[selected_month]} {selected_year}")
+            # Maak visuele kalender grid
+            st.write(f"### 📅 {calendar.month_name[selected_month]} {selected_year}")
+
+            # Get calendar for selected month
+            cal = calendar.monthcalendar(selected_year, selected_month)
+
+            # Create dividend lookup
+            dividend_days = {}
+            for _, row in month_filter.iterrows():
+                day = row['ex_date'].day
+                if day not in dividend_days:
+                    dividend_days[day] = []
+                dividend_days[day].append(row)
+
+            # Display calendar grid
+            st.write("")
+
+            # Header with day names
+            day_names = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo']
+            cols = st.columns(7)
+            for i, day_name in enumerate(day_names):
+                with cols[i]:
+                    st.markdown(f"**{day_name}**")
+
+            # Calendar days
+            for week in cal:
+                cols = st.columns(7)
+                for i, day in enumerate(week):
+                    with cols[i]:
+                        if day == 0:
+                            st.write("")  # Empty day
+                        else:
+                            # Check if this day has dividends
+                            if day in dividend_days:
+                                # Day with dividend(s)
+                                num_dividends = len(dividend_days[day])
+                                total_amount = sum(d['bruto_amount'] for d in dividend_days[day])
+
+                                if st.button(
+                                    f"**{day}**\n💰 {num_dividends}x\n€{total_amount:.0f}",
+                                    key=f"day_{selected_year}_{selected_month}_{day}",
+                                    use_container_width=True,
+                                    type="primary"
+                                ):
+                                    # Store selected day in session state
+                                    st.session_state['selected_dividend_day'] = day
+                            else:
+                                # Regular day without dividend
+                                st.markdown(f"<div style='text-align: center; padding: 10px; color: #666;'>{day}</div>", unsafe_allow_html=True)
+
+            st.divider()
+
+            # Show details for selected day
+            selected_day = st.session_state.get('selected_dividend_day', None)
+
+            if selected_day and selected_day in dividend_days:
+                day_data = dividend_days[selected_day]
+
+                st.write(f"### 📋 Details voor {selected_day} {calendar.month_name[selected_month]} {selected_year}")
+
+                for dividend in day_data:
+                    tax = dividend['bruto_amount'] * 0.30
+                    netto = dividend['bruto_amount'] - tax
+
+                    with st.container():
+                        st.write(f"**{dividend['name'] if pd.notna(dividend['name']) else dividend['ticker']}** ({dividend['ticker']})")
+
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Bruto", f"€{dividend['bruto_amount']:.2f}")
+                        with col2:
+                            st.metric("Tax (30%)", f"€{tax:.2f}")
+                        with col3:
+                            st.metric("Netto", f"€{netto:.2f}")
+
+                        if pd.notna(dividend['notes']) and dividend['notes']:
+                            st.info(f"📝 {dividend['notes']}")
+
+                        st.divider()
+            else:
+                st.info("👆 Klik op een dag met dividend (💰) om details te zien")
+
+            st.divider()
+
+            # Also show list view below
+            st.write("### 📋 Lijst View")
 
             # Groepeer per dag
             for day in sorted(month_filter['ex_date'].dt.day.unique()):
                 day_data = month_filter[month_filter['ex_date'].dt.day == day]
 
-                with st.expander(f"📅 {day} {calendar.month_name[selected_month]} - {len(day_data)} dividend(en)", expanded=True):
+                with st.expander(f"📅 {day} {calendar.month_name[selected_month]} - {len(day_data)} dividend(en)", expanded=False):
                     for _, row in day_data.iterrows():
                         tax = row['bruto_amount'] * 0.30
                         netto = row['bruto_amount'] - tax
@@ -786,11 +873,13 @@ with tab4:
                 st.write(f"**{len(display_data)} dividenden in buffer**")
 
                 # Import knoppen
-                col1, col2, col3 = st.columns(3)
+                st.write("")  # Spacer
 
-                with col1:
-                    if filter_ticker != "Alle aandelen":
-                        if st.button("✅ Importeer Alles van " + filter_ticker, type="primary", use_container_width=True):
+                if filter_ticker != "Alle aandelen":
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        if st.button(f"✅ Importeer {len(display_data)} dividenden van {filter_ticker}", type="primary", use_container_width=True, key="import_filtered"):
                             result = import_all_from_cache_to_db(filter_ticker)
 
                             if result['imported'] > 0:
@@ -804,8 +893,18 @@ with tab4:
 
                             st.rerun()
 
-                with col2:
-                    if st.button("🗑️ Wis Hele Buffer", type="secondary", use_container_width=True):
+                    with col2:
+                        if st.button(f"🗑️ Wis {filter_ticker} uit buffer", type="secondary", use_container_width=True, key="clear_filtered"):
+                            deleted = clear_cache(filter_ticker)
+                            st.success(f"✓ {deleted} items verwijderd uit buffer")
+                            st.rerun()
+                else:
+                    # Show option to import all from all tickers
+                    st.warning("⚠️ Selecteer een specifiek aandeel om te importeren")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🗑️ Wis Hele Buffer", type="secondary", use_container_width=True, key="clear_all"):
                         deleted = clear_cache()
                         st.success(f"✓ {deleted} items verwijderd uit buffer")
                         st.rerun()
