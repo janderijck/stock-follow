@@ -7,7 +7,7 @@ from datetime import datetime
 
 DB_PATH = Path("data.db")
 
-st.set_page_config(page_title="Portfolio Overzicht", page_icon="=Ê", layout="wide")
+st.set_page_config(page_title="Portfolio Overzicht", page_icon="ðŸ“Š", layout="wide")
 
 
 # --------- Database helpers ---------
@@ -107,7 +107,7 @@ def calculate_performance(avg_purchase_price, current_price, quantity):
 
 
 # --------- UI ---------
-st.title("=Ê Portfolio Overzicht")
+st.title("ðŸ“Š Portfolio Overzicht")
 
 # Haal portfolio data op
 holdings = get_portfolio_holdings()
@@ -148,11 +148,11 @@ with st.spinner("Huidige prijzen ophalen..."):
                 'Ticker': ticker,
                 'ISIN': row['isin'],
                 'Aantal': int(row['total_quantity']),
-                'Ø Aankoopprijs': f"¬{row['avg_purchase_price']:.2f}",
-                'Huidige Prijs': f"¬{current_price:.2f}",
-                'Totaal Geïnvesteerd': f"¬{perf['total_invested']:.2f}",
-                'Huidige Waarde': f"¬{perf['current_value']:.2f}",
-                'Winst/Verlies': f"¬{perf['total_gain_loss']:.2f}",
+                'Avg Aankoopprijs': f"â‚¬{row['avg_purchase_price']:.2f}",
+                'Huidige Prijs': f"â‚¬{current_price:.2f}",
+                'Totaal Geinvesteerd': f"â‚¬{perf['total_invested']:.2f}",
+                'Huidige Waarde': f"â‚¬{perf['current_value']:.2f}",
+                'Winst/Verlies': f"â‚¬{perf['total_gain_loss']:.2f}",
                 'Performance': f"{perf['gain_loss_percent']:+.2f}%",
                 '_current_price': current_price,
                 '_perf': perf,
@@ -166,9 +166,9 @@ with st.spinner("Huidige prijzen ophalen..."):
                 'Ticker': ticker,
                 'ISIN': row['isin'],
                 'Aantal': int(row['total_quantity']),
-                'Ø Aankoopprijs': f"¬{row['avg_purchase_price']:.2f}",
+                'Avg Aankoopprijs': f"â‚¬{row['avg_purchase_price']:.2f}",
                 'Huidige Prijs': "N/A",
-                'Totaal Geïnvesteerd': f"¬{row['total_invested_with_fees']:.2f}",
+                'Totaal Geinvesteerd': f"â‚¬{row['total_invested_with_fees']:.2f}",
                 'Huidige Waarde': "N/A",
                 'Winst/Verlies': "N/A",
                 'Performance': "N/A",
@@ -179,8 +179,8 @@ with st.spinner("Huidige prijzen ophalen..."):
 portfolio_df = pd.DataFrame(portfolio_data)
 
 # Toon portfolio tabel (zonder hidden columns)
-display_columns = ['Aandeel', 'Ticker', 'Aantal', 'Ø Aankoopprijs', 'Huidige Prijs',
-                   'Totaal Geïnvesteerd', 'Huidige Waarde', 'Winst/Verlies', 'Performance']
+display_columns = ['Aandeel', 'Ticker', 'Aantal', 'Avg Aankoopprijs', 'Huidige Prijs',
+                   'Totaal Geinvesteerd', 'Huidige Waarde', 'Winst/Verlies', 'Performance']
 
 st.dataframe(
     portfolio_df[display_columns],
@@ -199,15 +199,15 @@ st.divider()
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric("Totaal Geïnvesteerd", f"¬{total_invested:,.2f}")
+    st.metric("Totaal Geinvesteerd", f"â‚¬{total_invested:,.2f}")
 
 with col2:
-    st.metric("Huidige Waarde", f"¬{total_current:,.2f}")
+    st.metric("Huidige Waarde", f"â‚¬{total_current:,.2f}")
 
 with col3:
     st.metric(
         "Totale Winst/Verlies",
-        f"¬{total_gain_loss:,.2f}",
+        f"â‚¬{total_gain_loss:,.2f}",
         delta=f"{total_gain_loss_percent:+.2f}%"
     )
 
@@ -242,12 +242,12 @@ if selected_ticker:
         st.write("**Basis Informatie**")
         st.write(f"- ISIN: `{selected_data['ISIN']}`")
         st.write(f"- Aantal aandelen: **{selected_data['Aantal']}**")
-        st.write(f"- Ø Aankoopprijs: **{selected_data['Ø Aankoopprijs']}**")
+        st.write(f"- Avg Aankoopprijs: **{selected_data['Avg Aankoopprijs']}**")
 
     with col2:
         st.write("**Huidige Status**")
         st.write(f"- Huidige prijs: **{selected_data['Huidige Prijs']}**")
-        st.write(f"- Totaal geïnvesteerd: **{selected_data['Totaal Geïnvesteerd']}**")
+        st.write(f"- Totaal geinvesteerd: **{selected_data['Totaal Geinvesteerd']}**")
         st.write(f"- Huidige waarde: **{selected_data['Huidige Waarde']}**")
 
     with col3:
@@ -257,7 +257,7 @@ if selected_ticker:
         # Kleurcode voor performance
         if '_perf' in selected_data:
             perf_value = selected_data['_perf']['gain_loss_percent']
-            color = "=â" if perf_value >= 0 else "=4"
+            color = "ðŸŸ¢" if perf_value >= 0 else "ðŸ”´"
             st.write(f"- Performance: **{color} {selected_data['Performance']}**")
         else:
             st.write(f"- Performance: **{selected_data['Performance']}**")
@@ -285,5 +285,5 @@ if selected_ticker:
     st.dataframe(tx_df, use_container_width=True, hide_index=True)
 
     # Refresh button
-    if st.button("= Ververs prijzen", type="primary"):
+    if st.button("ðŸ”„ Ververs prijzen", type="primary"):
         st.rerun()
