@@ -141,7 +141,7 @@ def predict_next_dividend(ticker):
     return None
 
 
-def fetch_dividends_from_alphavantage(ticker):
+def fetch_dividends_from_alphavantage(ticker, debug=False):
     """Haalt dividend geschiedenis op van Alpha Vantage API."""
     api_key = get_setting('alpha_vantage_api_key', '')
 
@@ -158,6 +158,10 @@ def fetch_dividends_from_alphavantage(ticker):
 
         data = response.json()
 
+        # Debug mode: return raw response
+        if debug:
+            return {'debug': data, 'url': url}
+
         # Check for API errors
         if 'Error Message' in data:
             return {'error': data['Error Message']}
@@ -165,8 +169,13 @@ def fetch_dividends_from_alphavantage(ticker):
         if 'Note' in data:
             return {'error': 'API rate limit bereikt. Probeer het later opnieuw.'}
 
+        if 'Information' in data:
+            return {'error': f"API info: {data['Information']}"}
+
         if 'Time Series (Daily)' not in data:
-            return {'error': 'Geen data beschikbaar voor dit aandeel'}
+            # Show what keys we got instead
+            available_keys = ', '.join(data.keys())
+            return {'error': f'Geen "Time Series (Daily)" in response. Beschikbare keys: {available_keys}'}
 
         # Parse dividend data from time series
         time_series = data['Time Series (Daily)']
@@ -632,7 +641,7 @@ with tab4:
             # Stap 1: Ophalen van API data
             st.write("### 📥 Stap 1: Data Ophalen van API")
 
-            col1, col2 = st.columns([3, 1])
+            col1, col2, col3 = st.columns([3, 1, 1])
 
             with col1:
                 selected_stock = st.selectbox(
@@ -644,11 +653,23 @@ with tab4:
             with col2:
                 st.write("")  # Spacer
                 st.write("")  # Spacer
+                debug_mode = st.checkbox("🔍 Debug", help="Toon raw API response")
+
+            with col3:
+                st.write("")  # Spacer
+                st.write("")  # Spacer
                 if st.button("🔄 Haal Data Op", type="primary", use_container_width=True):
                     with st.spinner(f"Dividenden ophalen voor {selected_stock['ticker']}..."):
-                        result = fetch_dividends_from_alphavantage(selected_stock['ticker'])
+                        result = fetch_dividends_from_alphavantage(selected_stock['ticker'], debug=debug_mode)
 
-                        if 'error' in result:
+                        if 'debug' in result:
+                            # Debug mode - show raw response
+                            st.write("**🔍 Debug Info:**")
+                            st.write(f"**URL:** `{result['url']}`")
+                            st.write("**Raw API Response:**")
+                            st.json(result['debug'])
+
+                        elif 'error' in result:
                             st.error(f"❌ {result['error']}")
                         elif 'dividends' in result:
                             dividends = result['dividends']
