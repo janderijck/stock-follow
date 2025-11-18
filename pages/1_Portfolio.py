@@ -231,7 +231,12 @@ def calculate_dividends_received(ticker, isin, first_purchase_date):
 
     # Filter dividenden na eerste aankoop (ex-dividend date moet na aankoop zijn)
     first_date = pd.to_datetime(first_purchase_date)
+
+    # Converteer ex_date naar datetime en verwijder timezone info voor vergelijking
     div_history['ex_date'] = pd.to_datetime(div_history['ex_date'])
+    if div_history['ex_date'].dt.tz is not None:
+        div_history['ex_date'] = div_history['ex_date'].dt.tz_localize(None)
+
     relevant_divs = div_history[div_history['ex_date'] >= first_date]
 
     dividend_events = []
