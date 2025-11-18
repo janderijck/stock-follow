@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import calendar
 import requests
+import yfinance as yf
 
 DB_PATH = Path("data.db")
 
@@ -139,6 +140,45 @@ def predict_next_dividend(ticker):
         }
 
     return None
+
+
+def fetch_dividends_from_yfinance(ticker, debug=False):
+    """Haalt dividend geschiedenis op van Yahoo Finance via yfinance."""
+    try:
+        # Create ticker object
+        stock = yf.Ticker(ticker)
+
+        # Get dividend history
+        dividends_series = stock.dividends
+
+        if debug:
+            return {
+                'debug': {
+                    'ticker': ticker,
+                    'dividends_count': len(dividends_series),
+                    'dividends_series': dividends_series.to_dict(),
+                    'info_keys': list(stock.info.keys()) if hasattr(stock, 'info') else []
+                }
+            }
+
+        if dividends_series.empty:
+            return {'error': f'Geen dividend geschiedenis gevonden voor {ticker}'}
+
+        # Convert to list of dicts
+        dividends = []
+        for date, amount in dividends_series.items():
+            dividends.append({
+                'ex_date': date.strftime('%Y-%m-%d'),
+                'amount': float(amount)
+            })
+
+        # Sort by date descending (most recent first)
+        dividends.sort(key=lambda x: x['ex_date'], reverse=True)
+
+        return {'dividends': dividends}
+
+    except Exception as e:
+        return {'error': f'Fout bij ophalen van dividend data: {str(e)}'}
 
 
 def fetch_dividends_from_alphavantage(ticker, debug=False):
@@ -332,7 +372,7 @@ def import_from_cache_to_db(ticker, ex_date):
         INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (ticker, isin, ex_date, amount, "Geïmporteerd van Alpha Vantage via cache")
+        (ticker, isin, ex_date, amount, "Geïmporteerd van Yahoo Finance via cache")
     )
 
     conn.commit()
@@ -384,7 +424,7 @@ def import_all_from_cache_to_db(ticker):
             INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (ticker, isin, ex_date, amount, "Geïmporteerd van Alpha Vantage via cache")
+            (ticker, isin, ex_date, amount, "Geïmporteerd van Yahoo Finance via cache")
         )
         imported_count += 1
 
@@ -415,7 +455,7 @@ def import_dividend_to_db(ticker, isin, ex_date, amount):
         INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (ticker, isin, ex_date, amount, "Automatisch geïmporteerd van Alpha Vantage")
+        (ticker, isin, ex_date, amount, "Automatisch geïmporteerd van Yahoo Finance")
     )
 
     conn.commit()
@@ -618,75 +658,63 @@ with tab3:
 # Tab 4: Import Dividenden
 with tab4:
     st.subheader("⬇️ Dividend Geschiedenis Importeren")
-    st.info("📡 Haal dividend data op van Alpha Vantage. De data wordt eerst in een buffer opgeslagen zodat je deze kan controleren voordat je importeert.")
+    st.info("📡 Haal dividend data op van Yahoo Finance (gratis & betrouwbaar). De data wordt eerst in een buffer opgeslagen zodat je deze kan controleren voordat je importeert.")
 
-    # Check of API key is ingesteld
-    api_key = get_setting('alpha_vantage_api_key', '')
+    # Haal portfolio aandelen op
+    portfolio_stocks = get_portfolio_stocks_with_isin()
 
-    if not api_key:
-        st.warning("⚠️ Geen Alpha Vantage API key ingesteld!")
-        st.write("Ga naar **Admin > API Settings** om je API key in te stellen.")
-        st.write("[Vraag gratis API key aan](https://www.alphavantage.co/support/#api-key)")
+    if not portfolio_stocks:
+        st.warning("Geen aandelen gevonden in je portfolio.")
     else:
-        st.success("✓ Alpha Vantage API key actief")
+        st.write(f"**{len(portfolio_stocks)} aandelen gevonden in je portfolio**")
 
-        # Haal portfolio aandelen op
-        portfolio_stocks = get_portfolio_stocks_with_isin()
+        # Stap 1: Ophalen van API data
+        st.write("### 📥 Stap 1: Data Ophalen van Yahoo Finance")
 
-        if not portfolio_stocks:
-            st.warning("Geen aandelen gevonden in je portfolio.")
-        else:
-            st.write(f"**{len(portfolio_stocks)} aandelen gevonden in je portfolio**")
+        col1, col2, col3 = st.columns([3, 1, 1])
 
-            # Stap 1: Ophalen van API data
-            st.write("### 📥 Stap 1: Data Ophalen van API")
+        with col1:
+            selected_stock = st.selectbox(
+                "Selecteer aandeel om dividend data op te halen:",
+                options=portfolio_stocks,
+                format_func=lambda x: f"{x['name']} ({x['ticker']})"
+            )
 
-            col1, col2, col3 = st.columns([3, 1, 1])
+        with col2:
+            st.write("")  # Spacer
+            st.write("")  # Spacer
+            debug_mode = st.checkbox("🔍 Debug", help="Toon raw data response")
 
-            with col1:
-                selected_stock = st.selectbox(
-                    "Selecteer aandeel om dividend data op te halen:",
-                    options=portfolio_stocks,
-                    format_func=lambda x: f"{x['name']} ({x['ticker']})"
-                )
+        with col3:
+            st.write("")  # Spacer
+            st.write("")  # Spacer
+            if st.button("🔄 Haal Data Op", type="primary", use_container_width=True):
+                with st.spinner(f"Dividenden ophalen voor {selected_stock['ticker']}..."):
+                    result = fetch_dividends_from_yfinance(selected_stock['ticker'], debug=debug_mode)
 
-            with col2:
-                st.write("")  # Spacer
-                st.write("")  # Spacer
-                debug_mode = st.checkbox("🔍 Debug", help="Toon raw API response")
+                    if 'debug' in result:
+                        # Debug mode - show raw response
+                        st.write("**🔍 Debug Info:**")
+                        st.json(result['debug'])
 
-            with col3:
-                st.write("")  # Spacer
-                st.write("")  # Spacer
-                if st.button("🔄 Haal Data Op", type="primary", use_container_width=True):
-                    with st.spinner(f"Dividenden ophalen voor {selected_stock['ticker']}..."):
-                        result = fetch_dividends_from_alphavantage(selected_stock['ticker'], debug=debug_mode)
+                    elif 'error' in result:
+                        st.error(f"❌ {result['error']}")
+                    elif 'dividends' in result:
+                        dividends = result['dividends']
 
-                        if 'debug' in result:
-                            # Debug mode - show raw response
-                            st.write("**🔍 Debug Info:**")
-                            st.write(f"**URL:** `{result['url']}`")
-                            st.write("**Raw API Response:**")
-                            st.json(result['debug'])
+                        if not dividends:
+                            st.info(f"Geen dividend geschiedenis gevonden voor {selected_stock['ticker']}")
+                        else:
+                            # Sla op in cache
+                            cache_result = save_dividends_to_cache(
+                                selected_stock['ticker'],
+                                selected_stock['isin'],
+                                dividends
+                            )
 
-                        elif 'error' in result:
-                            st.error(f"❌ {result['error']}")
-                        elif 'dividends' in result:
-                            dividends = result['dividends']
-
-                            if not dividends:
-                                st.info(f"Geen dividend geschiedenis gevonden voor {selected_stock['ticker']}")
-                            else:
-                                # Sla op in cache
-                                cache_result = save_dividends_to_cache(
-                                    selected_stock['ticker'],
-                                    selected_stock['isin'],
-                                    dividends
-                                )
-
-                                st.success(f"✓ {len(dividends)} dividenden opgehaald en opgeslagen in buffer!")
-                                st.info(f"ℹ️ Nieuw: {cache_result['added']}, Geüpdatet: {cache_result['updated']}")
-                                st.rerun()
+                            st.success(f"✓ {len(dividends)} dividenden opgehaald en opgeslagen in buffer!")
+                            st.info(f"ℹ️ Nieuw: {cache_result['added']}, Geüpdatet: {cache_result['updated']}")
+                            st.rerun()
 
             # Toon laatste update per ticker
             if selected_stock:
@@ -783,12 +811,17 @@ with tab4:
                         st.rerun()
 
             st.divider()
-            st.warning("""
-            **Let op:**
-            - Alpha Vantage heeft rate limits (25 API calls per dag voor gratis accounts)
-            - Niet alle aandelen zijn beschikbaar in Alpha Vantage (vooral Europese aandelen kunnen ontbreken)
+            st.info("""
+            **Yahoo Finance voordelen:**
+            - ✅ Gratis en geen rate limits
+            - ✅ Uitstekende coverage voor US stocks
+            - ✅ Goede coverage voor Europese stocks (met juiste ticker suffix)
+            - ✅ Historische dividend data (vaak 10+ jaar)
+
+            **Tips:**
             - Data wordt eerst in een buffer opgeslagen zodat je deze kan controleren
             - Gebruik de buffer om te voorkomen dat je dubbele data importeert
+            - Voor Europese aandelen: zorg dat ticker de juiste suffix heeft (bijv. KBC.BR)
             """)
 
 # Nuttige links en bronnen
