@@ -317,6 +317,9 @@ with st.spinner("Huidige prijzen ophalen..."):
                 ticker
             )
 
+            # Haal dividend info op
+            div_info = calculate_total_dividends(ticker)
+
             portfolio_data.append({
                 'Aandeel': row['name'],
                 'Ticker': ticker,
@@ -326,6 +329,7 @@ with st.spinner("Huidige prijzen ophalen..."):
                 'Huidige Prijs': f"€{current_price:.2f}",
                 'Totaal Geinvesteerd': f"€{perf['total_invested']:.2f}",
                 'Huidige Waarde': f"€{perf['current_value']:.2f}",
+                'Dividend (netto)': f"€{div_info['total_netto']:.2f}",
                 'Winst/Verlies': f"€{perf['total_gain_loss']:.2f}",
                 'Performance': f"{perf['gain_loss_percent']:+.2f}%",
                 '_current_price': current_price,
@@ -335,6 +339,8 @@ with st.spinner("Huidige prijzen ophalen..."):
             })
         else:
             # Kon prijs niet ophalen
+            div_info = calculate_total_dividends(ticker)
+
             portfolio_data.append({
                 'Aandeel': row['name'],
                 'Ticker': ticker,
@@ -344,6 +350,7 @@ with st.spinner("Huidige prijzen ophalen..."):
                 'Huidige Prijs': "N/A",
                 'Totaal Geinvesteerd': f"€{row['total_invested_with_fees']:.2f}",
                 'Huidige Waarde': "N/A",
+                'Dividend (netto)': f"€{div_info['total_netto']:.2f}",
                 'Winst/Verlies': "N/A",
                 'Performance': "N/A",
                 '_error': price_info.get('error', 'Onbekende fout') if price_info else 'API error'
@@ -354,7 +361,7 @@ portfolio_df = pd.DataFrame(portfolio_data)
 
 # Toon portfolio tabel (zonder hidden columns)
 display_columns = ['Aandeel', 'Ticker', 'Aantal', 'Avg Aankoopprijs', 'Huidige Prijs',
-                   'Totaal Geinvesteerd', 'Huidige Waarde', 'Winst/Verlies', 'Performance']
+                   'Totaal Geinvesteerd', 'Huidige Waarde', 'Dividend (netto)', 'Winst/Verlies', 'Performance']
 
 st.dataframe(
     portfolio_df[display_columns],

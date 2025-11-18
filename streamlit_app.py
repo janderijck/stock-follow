@@ -118,6 +118,26 @@ def insert_transaction(date, broker, transaction_type, name, ticker, isin, quant
     conn.close()
 
 
+def get_available_shares(ticker):
+    """Berekent het aantal beschikbare aandelen voor een ticker."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT SUM(CASE WHEN transaction_type = 'BUY' THEN quantity ELSE -quantity END) as available
+        FROM transactions
+        WHERE ticker = ?
+        """,
+        (ticker.upper(),)
+    )
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return result[0] if result[0] is not None else 0
+
+
 def load_transactions():
     conn = get_connection()
     df = pd.read_sql_query(
@@ -309,10 +329,21 @@ if submitted:
     if not (broker and name and ticker and isin and quantity > 0):
         st.error("Vul alle verplichte velden in.")
     else:
-        insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
-        st.success("✓ Transactie opgeslagen.")
-        # Clear session state after saving
-        st.session_state.security_data = {}
+        # Extra validatie voor SELL transacties
+        if transaction_type == "SELL":
+            available = get_available_shares(ticker)
+            if available < quantity:
+                st.error(f"❌ Onvoldoende aandelen! Je hebt {available} aandelen van {ticker}, maar probeert {quantity} te verkopen.")
+            else:
+                insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
+                st.success(f"✓ SELL transactie opgeslagen. Resterende aandelen: {available - quantity}")
+                # Clear session state after saving
+                st.session_state.security_data = {}
+        else:
+            insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
+            st.success("✓ Transactie opgeslagen.")
+            # Clear session state after saving
+            st.session_state.security_data = {}
 
 
 st.subheader("Bewaarde transacties")
