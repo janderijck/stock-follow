@@ -430,29 +430,50 @@ if selected_ticker:
 
                 # Bereken totaal dividend ontvangen
                 current_quantity = selected_data['Aantal']
-                total_dividends = 0
+                total_dividends_bruto = 0
+                total_tax = 0
+                total_dividends_netto = 0
+
+                TAX_RATE = 0.30  # 30% roerende voorheffing
 
                 # Maak dividend tabel
                 div_table_data = []
                 for event in dividend_events:
                     div_amount = event['amount_per_share']
-                    total_for_event = div_amount * current_quantity
-                    total_dividends += total_for_event
+                    bruto_for_event = div_amount * current_quantity
+                    tax_for_event = bruto_for_event * TAX_RATE
+                    netto_for_event = bruto_for_event - tax_for_event
+
+                    total_dividends_bruto += bruto_for_event
+                    total_tax += tax_for_event
+                    total_dividends_netto += netto_for_event
 
                     div_table_data.append({
                         'Ex-Dividend Datum': event['ex_date'].strftime('%Y-%m-%d'),
-                        'Dividend per aandeel': f"€{div_amount:.4f}",
-                        'Totaal (bij {current_quantity} aandelen)': f"€{total_for_event:.2f}"
+                        'Per aandeel': f"€{div_amount:.4f}",
+                        f'Bruto ({current_quantity}x)': f"€{bruto_for_event:.2f}",
+                        'Tax (30%)': f"€{tax_for_event:.2f}",
+                        'Netto': f"€{netto_for_event:.2f}"
                     })
 
                 # Toon dividend tabel
                 div_df = pd.DataFrame(div_table_data)
                 st.dataframe(div_df, use_container_width=True, hide_index=True)
 
-                # Toon totaal
-                st.success(f"**Geschat totaal dividend ontvangen: €{total_dividends:.2f}**")
+                # Toon totalen in kolommen
+                st.divider()
+                col1, col2, col3 = st.columns(3)
 
-                st.info("ℹ️ Dit is een schatting gebaseerd op het huidige aantal aandelen en ex-dividend datums na je eerste aankoop. Werkelijk ontvangen dividenden kunnen afwijken.")
+                with col1:
+                    st.metric("Totaal Bruto Dividend", f"€{total_dividends_bruto:.2f}")
+
+                with col2:
+                    st.metric("Roerende Voorheffing (30%)", f"€{total_tax:.2f}", delta=None, delta_color="off")
+
+                with col3:
+                    st.metric("Totaal Netto Dividend", f"€{total_dividends_netto:.2f}", delta=f"+{total_dividends_netto:.2f}")
+
+                st.info("ℹ️ Dit is een schatting gebaseerd op het huidige aantal aandelen en ex-dividend datums na je eerste aankoop. Roerende voorheffing van 30% is automatisch ingehouden.")
             else:
                 st.info("Dit aandeel heeft geen dividend uitgekeerd sinds je eerste aankoop, of dividend data is niet beschikbaar.")
     else:
