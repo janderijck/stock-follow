@@ -15,7 +15,87 @@ st.set_page_config(page_title="Portfolio Overzicht", page_icon="📊", layout="w
 # --------- Database helpers ---------
 def get_connection():
     """Maakt verbinding met de database."""
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+
+    # Zorg dat dividends tabel bestaat
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS dividends (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        isin TEXT NOT NULL,
+        ex_date TEXT NOT NULL,
+        bruto_amount REAL NOT NULL,
+        notes TEXT
+    );
+    """)
+
+    return conn
+
+
+def add_dividend(ticker, isin, ex_date, bruto_amount, notes=""):
+    """Voegt een handmatig ingevoerd dividend toe."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO dividends (ticker, isin, ex_date, bruto_amount, notes)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (ticker, isin, ex_date.isoformat(), float(bruto_amount), notes)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_manual_dividends(ticker):
+    """Haalt alle handmatig ingevoerde dividenden op voor een ticker."""
+    conn = get_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT id, ex_date, bruto_amount, notes
+        FROM dividends
+        WHERE ticker = ?
+        ORDER BY ex_date DESC
+        """,
+        conn,
+        params=(ticker,)
+    )
+    conn.close()
+    return df
+
+
+def delete_dividend(dividend_id):
+    """Verwijdert een dividend entry."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM dividends WHERE id = ?", (dividend_id,))
+    conn.commit()
+    conn.close()
+
+
+def calculate_total_dividends(ticker):
+    """Berekent totaal ontvangen dividend (bruto en netto) voor een ticker."""
+    df = get_manual_dividends(ticker)
+
+    if df.empty:
+        return {
+            'total_bruto': 0,
+            'total_tax': 0,
+            'total_netto': 0,
+            'count': 0
+        }
+
+    TAX_RATE = 0.30
+    total_bruto = df['bruto_amount'].sum()
+    total_tax = total_bruto * TAX_RATE
+    total_netto = total_bruto - total_tax
+
+    return {
+        'total_bruto': total_bruto,
+        'total_tax': total_tax,
+        'total_netto': total_netto,
+        'count': len(df)
+    }
 
 
 def get_portfolio_holdings():
@@ -173,80 +253,29 @@ def get_current_price(ticker, isin=None):
         return {"error": f"Fout bij ophalen prijs: {str(e)}"}
 
 
-def calculate_performance(avg_purchase_price, current_price, quantity):
-    """Berekent winst/verlies statistieken."""
+def calculate_performance(avg_purchase_price, current_price, quantity, ticker=None):
+    """Berekent winst/verlies statistieken, inclusief ontvangen dividenden."""
     total_invested = avg_purchase_price * quantity
     current_value = current_price * quantity
-    total_gain_loss = current_value - total_invested
-    gain_loss_percent = ((current_price - avg_purchase_price) / avg_purchase_price) * 100
+
+    # Haal dividend data op als ticker gegeven is
+    total_dividends_netto = 0
+    if ticker:
+        div_info = calculate_total_dividends(ticker)
+        total_dividends_netto = div_info['total_netto']
+
+    # Bereken totale winst/verlies inclusief dividenden
+    total_gain_loss = (current_value + total_dividends_netto) - total_invested
+    gain_loss_percent = (total_gain_loss / total_invested) * 100 if total_invested > 0 else 0
 
     return {
         'total_invested': total_invested,
         'current_value': current_value,
+        'total_dividends_netto': total_dividends_netto,
         'total_gain_loss': total_gain_loss,
+        'total_gain_loss_excl_div': current_value - total_invested,
         'gain_loss_percent': gain_loss_percent
     }
-
-
-def get_dividend_history(ticker, isin=None):
-    """
-    Haalt dividend geschiedenis op voor een ticker.
-    Retourneert DataFrame met ex-dividend dates en bedragen.
-    """
-    # Probeer de juiste ticker te krijgen via ISIN
-    yahoo_ticker = ticker
-    if isin:
-        isin_ticker = get_yahoo_ticker_from_isin(isin)
-        if isin_ticker:
-            yahoo_ticker = isin_ticker
-
-    try:
-        stock = yf.Ticker(yahoo_ticker)
-        dividends = stock.dividends
-
-        if dividends.empty:
-            return pd.DataFrame()
-
-        # Converteer naar DataFrame met duidelijke kolommen
-        div_df = pd.DataFrame({
-            'ex_date': dividends.index,
-            'amount': dividends.values
-        })
-
-        return div_df
-
-    except Exception:
-        return pd.DataFrame()
-
-
-def calculate_dividends_received(ticker, isin, first_purchase_date):
-    """
-    Berekent welke dividenden ontvangen zouden zijn sinds de eerste aankoop.
-    Retourneert lijst van dividend events.
-    """
-    div_history = get_dividend_history(ticker, isin)
-
-    if div_history.empty:
-        return []
-
-    # Filter dividenden na eerste aankoop (ex-dividend date moet na aankoop zijn)
-    first_date = pd.to_datetime(first_purchase_date)
-
-    # Converteer ex_date naar datetime en verwijder timezone info voor vergelijking
-    div_history['ex_date'] = pd.to_datetime(div_history['ex_date'])
-    if div_history['ex_date'].dt.tz is not None:
-        div_history['ex_date'] = div_history['ex_date'].dt.tz_localize(None)
-
-    relevant_divs = div_history[div_history['ex_date'] >= first_date]
-
-    dividend_events = []
-    for _, row in relevant_divs.iterrows():
-        dividend_events.append({
-            'ex_date': row['ex_date'],
-            'amount_per_share': row['amount']
-        })
-
-    return dividend_events
 
 
 # --------- UI ---------
@@ -280,11 +309,12 @@ with st.spinner("Huidige prijzen ophalen..."):
         if price_info and 'error' not in price_info:
             current_price = price_info['current_price']
 
-            # Bereken performance
+            # Bereken performance (inclusief dividenden)
             perf = calculate_performance(
                 row['avg_purchase_price'],
                 current_price,
-                row['total_quantity']
+                row['total_quantity'],
+                ticker
             )
 
             portfolio_data.append({
@@ -408,81 +438,110 @@ if selected_ticker:
 
     # Dividend sectie
     st.divider()
-    st.write("### 💰 Dividend Informatie")
+    st.write("### 💰 Dividend Beheer")
 
-    # Haal eerste aankoopdatum op
-    conn = get_connection()
-    first_date_query = f"""
-    SELECT MIN(date) as first_date
-    FROM transactions
-    WHERE ticker = '{selected_ticker}' AND transaction_type = 'BUY'
-    """
-    first_date_result = pd.read_sql_query(first_date_query, conn)
-    conn.close()
+    # Formulier om dividend toe te voegen
+    with st.expander("➕ Nieuw dividend toevoegen", expanded=False):
+        with st.form(f"dividend_form_{selected_ticker}"):
+            col1, col2 = st.columns(2)
 
-    first_purchase_date = first_date_result['first_date'].iloc[0] if not first_date_result.empty else None
+            with col1:
+                div_date = st.date_input("Ex-Dividend Datum", key=f"div_date_{selected_ticker}")
+                div_amount = st.number_input(
+                    "Bruto bedrag (€)",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    help="Voer het totale bruto dividend in (voor al je aandelen)",
+                    key=f"div_amount_{selected_ticker}"
+                )
 
-    if first_purchase_date:
-        with st.spinner("Dividend gegevens ophalen..."):
-            dividend_events = calculate_dividends_received(
-                selected_ticker,
-                selected_data['ISIN'],
-                first_purchase_date
+            with col2:
+                div_notes = st.text_area(
+                    "Notities (optioneel)",
+                    height=100,
+                    key=f"div_notes_{selected_ticker}"
+                )
+
+            div_submitted = st.form_submit_button("💾 Dividend opslaan")
+
+            if div_submitted and div_amount > 0:
+                add_dividend(
+                    selected_ticker,
+                    selected_data['ISIN'],
+                    div_date,
+                    div_amount,
+                    div_notes
+                )
+                st.success(f"✓ Dividend van €{div_amount:.2f} toegevoegd!")
+                st.rerun()
+
+    # Haal bestaande dividenden op
+    dividends_df = get_manual_dividends(selected_ticker)
+
+    if not dividends_df.empty:
+        st.write("#### Ontvangen Dividenden")
+
+        # Bereken totalen
+        div_info = calculate_total_dividends(selected_ticker)
+        TAX_RATE = 0.30
+
+        # Maak tabel met actie knoppen
+        div_table_data = []
+        for _, row in dividends_df.iterrows():
+            bruto = row['bruto_amount']
+            tax = bruto * TAX_RATE
+            netto = bruto - tax
+
+            div_table_data.append({
+                'ID': row['id'],
+                'Ex-Dividend Datum': row['ex_date'],
+                'Bruto': f"€{bruto:.2f}",
+                'Tax (30%)': f"€{tax:.2f}",
+                'Netto': f"€{netto:.2f}",
+                'Notities': row['notes'] if row['notes'] else '-'
+            })
+
+        div_display_df = pd.DataFrame(div_table_data)
+
+        # Toon tabel (zonder ID kolom in display)
+        st.dataframe(
+            div_display_df[['Ex-Dividend Datum', 'Bruto', 'Tax (30%)', 'Netto', 'Notities']],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Delete functionaliteit
+        with st.expander("🗑️ Dividend verwijderen"):
+            delete_id = st.selectbox(
+                "Selecteer dividend om te verwijderen",
+                options=div_display_df['ID'].tolist(),
+                format_func=lambda x: f"{div_display_df[div_display_df['ID']==x]['Ex-Dividend Datum'].values[0]} - {div_display_df[div_display_df['ID']==x]['Bruto'].values[0]}"
             )
 
-            if dividend_events:
-                st.write(f"Sinds eerste aankoop ({first_purchase_date}) zijn er **{len(dividend_events)} dividend uitkeringen** geweest:")
+            if st.button("🗑️ Verwijder geselecteerd dividend", type="secondary"):
+                delete_dividend(delete_id)
+                st.success("Dividend verwijderd!")
+                st.rerun()
 
-                # Bereken totaal dividend ontvangen
-                current_quantity = selected_data['Aantal']
-                total_dividends_bruto = 0
-                total_tax = 0
-                total_dividends_netto = 0
+        # Toon totalen
+        st.divider()
+        col1, col2, col3 = st.columns(3)
 
-                TAX_RATE = 0.30  # 30% roerende voorheffing
+        with col1:
+            st.metric("Totaal Bruto Dividend", f"€{div_info['total_bruto']:.2f}")
 
-                # Maak dividend tabel
-                div_table_data = []
-                for event in dividend_events:
-                    div_amount = event['amount_per_share']
-                    bruto_for_event = div_amount * current_quantity
-                    tax_for_event = bruto_for_event * TAX_RATE
-                    netto_for_event = bruto_for_event - tax_for_event
+        with col2:
+            st.metric("Roerende Voorheffing (30%)", f"€{div_info['total_tax']:.2f}", delta=None, delta_color="off")
 
-                    total_dividends_bruto += bruto_for_event
-                    total_tax += tax_for_event
-                    total_dividends_netto += netto_for_event
+        with col3:
+            st.metric("Totaal Netto Dividend", f"€{div_info['total_netto']:.2f}", delta=f"+{div_info['total_netto']:.2f}")
 
-                    div_table_data.append({
-                        'Ex-Dividend Datum': event['ex_date'].strftime('%Y-%m-%d'),
-                        'Per aandeel': f"€{div_amount:.4f}",
-                        f'Bruto ({current_quantity}x)': f"€{bruto_for_event:.2f}",
-                        'Tax (30%)': f"€{tax_for_event:.2f}",
-                        'Netto': f"€{netto_for_event:.2f}"
-                    })
-
-                # Toon dividend tabel
-                div_df = pd.DataFrame(div_table_data)
-                st.dataframe(div_df, use_container_width=True, hide_index=True)
-
-                # Toon totalen in kolommen
-                st.divider()
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-                    st.metric("Totaal Bruto Dividend", f"€{total_dividends_bruto:.2f}")
-
-                with col2:
-                    st.metric("Roerende Voorheffing (30%)", f"€{total_tax:.2f}", delta=None, delta_color="off")
-
-                with col3:
-                    st.metric("Totaal Netto Dividend", f"€{total_dividends_netto:.2f}", delta=f"+{total_dividends_netto:.2f}")
-
-                st.info("ℹ️ Dit is een schatting gebaseerd op het huidige aantal aandelen en ex-dividend datums na je eerste aankoop. Roerende voorheffing van 30% is automatisch ingehouden.")
-            else:
-                st.info("Dit aandeel heeft geen dividend uitgekeerd sinds je eerste aankoop, of dividend data is niet beschikbaar.")
+        # Toon impact op totale performance
+        if '_perf' in selected_data:
+            st.info(f"💡 Je totale winst/verlies (inclusief €{div_info['total_netto']:.2f} netto dividend) is: **€{selected_data['_perf']['total_gain_loss']:.2f}** ({selected_data['_perf']['gain_loss_percent']:+.2f}%)")
     else:
-        st.warning("Kon eerste aankoopdatum niet bepalen.")
+        st.info("Nog geen dividenden toegevoegd. Gebruik het formulier hierboven om dividenden toe te voegen.")
 
     # Haal gedetailleerde transactie geschiedenis op
     st.divider()
