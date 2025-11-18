@@ -188,6 +188,62 @@ def calculate_performance(avg_purchase_price, current_price, quantity):
     }
 
 
+def get_dividend_history(ticker, isin=None):
+    """
+    Haalt dividend geschiedenis op voor een ticker.
+    Retourneert DataFrame met ex-dividend dates en bedragen.
+    """
+    # Probeer de juiste ticker te krijgen via ISIN
+    yahoo_ticker = ticker
+    if isin:
+        isin_ticker = get_yahoo_ticker_from_isin(isin)
+        if isin_ticker:
+            yahoo_ticker = isin_ticker
+
+    try:
+        stock = yf.Ticker(yahoo_ticker)
+        dividends = stock.dividends
+
+        if dividends.empty:
+            return pd.DataFrame()
+
+        # Converteer naar DataFrame met duidelijke kolommen
+        div_df = pd.DataFrame({
+            'ex_date': dividends.index,
+            'amount': dividends.values
+        })
+
+        return div_df
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def calculate_dividends_received(ticker, isin, first_purchase_date):
+    """
+    Berekent welke dividenden ontvangen zouden zijn sinds de eerste aankoop.
+    Retourneert lijst van dividend events.
+    """
+    div_history = get_dividend_history(ticker, isin)
+
+    if div_history.empty:
+        return []
+
+    # Filter dividenden na eerste aankoop (ex-dividend date moet na aankoop zijn)
+    first_date = pd.to_datetime(first_purchase_date)
+    div_history['ex_date'] = pd.to_datetime(div_history['ex_date'])
+    relevant_divs = div_history[div_history['ex_date'] >= first_date]
+
+    dividend_events = []
+    for _, row in relevant_divs.iterrows():
+        dividend_events.append({
+            'ex_date': row['ex_date'],
+            'amount_per_share': row['amount']
+        })
+
+    return dividend_events
+
+
 # --------- UI ---------
 st.title("📊 Portfolio Overzicht")
 
@@ -345,8 +401,66 @@ if selected_ticker:
         else:
             st.write(f"- Performance: **{selected_data['Performance']}**")
 
+    # Dividend sectie
+    st.divider()
+    st.write("### 💰 Dividend Informatie")
+
+    # Haal eerste aankoopdatum op
+    conn = get_connection()
+    first_date_query = f"""
+    SELECT MIN(date) as first_date
+    FROM transactions
+    WHERE ticker = '{selected_ticker}' AND transaction_type = 'BUY'
+    """
+    first_date_result = pd.read_sql_query(first_date_query, conn)
+    conn.close()
+
+    first_purchase_date = first_date_result['first_date'].iloc[0] if not first_date_result.empty else None
+
+    if first_purchase_date:
+        with st.spinner("Dividend gegevens ophalen..."):
+            dividend_events = calculate_dividends_received(
+                selected_ticker,
+                selected_data['ISIN'],
+                first_purchase_date
+            )
+
+            if dividend_events:
+                st.write(f"Sinds eerste aankoop ({first_purchase_date}) zijn er **{len(dividend_events)} dividend uitkeringen** geweest:")
+
+                # Bereken totaal dividend ontvangen
+                current_quantity = selected_data['Aantal']
+                total_dividends = 0
+
+                # Maak dividend tabel
+                div_table_data = []
+                for event in dividend_events:
+                    div_amount = event['amount_per_share']
+                    total_for_event = div_amount * current_quantity
+                    total_dividends += total_for_event
+
+                    div_table_data.append({
+                        'Ex-Dividend Datum': event['ex_date'].strftime('%Y-%m-%d'),
+                        'Dividend per aandeel': f"€{div_amount:.4f}",
+                        'Totaal (bij {current_quantity} aandelen)': f"€{total_for_event:.2f}"
+                    })
+
+                # Toon dividend tabel
+                div_df = pd.DataFrame(div_table_data)
+                st.dataframe(div_df, use_container_width=True, hide_index=True)
+
+                # Toon totaal
+                st.success(f"**Geschat totaal dividend ontvangen: €{total_dividends:.2f}**")
+
+                st.info("ℹ️ Dit is een schatting gebaseerd op het huidige aantal aandelen en ex-dividend datums na je eerste aankoop. Werkelijk ontvangen dividenden kunnen afwijken.")
+            else:
+                st.info("Dit aandeel heeft geen dividend uitgekeerd sinds je eerste aankoop, of dividend data is niet beschikbaar.")
+    else:
+        st.warning("Kon eerste aankoopdatum niet bepalen.")
+
     # Haal gedetailleerde transactie geschiedenis op
-    st.write("### Transactie Geschiedenis")
+    st.divider()
+    st.write("### 📜 Transactie Geschiedenis")
 
     conn = get_connection()
     tx_query = f"""
