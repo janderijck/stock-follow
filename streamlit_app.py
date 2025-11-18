@@ -284,7 +284,10 @@ if st.session_state.security_data:
 st.divider()
 
 # Transaction Form
-with st.form("new_transaction"):
+# Gebruik een dynamische form key om het formulier opnieuw te renderen wanneer security_data verandert
+form_key = f"new_transaction_{hash(str(st.session_state.security_data))}"
+
+with st.form(form_key):
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -293,20 +296,17 @@ with st.form("new_transaction"):
         transaction_type = st.selectbox("Type", ["BUY", "SELL"])
         name = st.text_input(
             "Naam aandeel",
-            value=st.session_state.security_data.get('name', ''),
-            key="name_input"
+            value=st.session_state.security_data.get('name', '')
         )
 
     with col2:
         ticker = st.text_input(
             "Ticker (bv. AAPL)",
-            value=st.session_state.security_data.get('ticker', ''),
-            key="ticker_input"
+            value=st.session_state.security_data.get('ticker', '')
         )
         isin = st.text_input(
             "ISIN",
-            value=st.session_state.security_data.get('isin', ''),
-            key="isin_input"
+            value=st.session_state.security_data.get('isin', '')
         )
         quantity = st.number_input("Aantal aandelen", min_value=1, step=1)
         price_per_share = st.number_input(
