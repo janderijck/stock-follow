@@ -29,6 +29,17 @@ def get_connection():
     );
     """)
 
+    # Zorg dat price_cache tabel bestaat
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS price_cache (
+        ticker TEXT PRIMARY KEY,
+        current_price REAL NOT NULL,
+        change_percent REAL,
+        currency TEXT,
+        updated_at TEXT NOT NULL
+    );
+    """)
+
     return conn
 
 
@@ -50,6 +61,63 @@ def format_currency(amount, currency='EUR'):
         return f"€{amount:.2f}"
     else:
         return f"{symbol}{amount:.2f}"
+
+
+def get_cached_price(ticker):
+    """Haalt de gecachte prijs op voor een ticker."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT current_price, change_percent, currency, updated_at FROM price_cache WHERE ticker = ?",
+        (ticker,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+
+    if result:
+        return {
+            'current_price': result[0],
+            'change_percent': result[1],
+            'currency': result[2],
+            'updated_at': result[3]
+        }
+    return None
+
+
+def save_price_to_cache(ticker, current_price, change_percent, currency):
+    """Slaat een prijs op in de cache."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    updated_at = datetime.now().isoformat()
+
+    cursor.execute(
+        """
+        INSERT INTO price_cache (ticker, current_price, change_percent, currency, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            current_price = ?,
+            change_percent = ?,
+            currency = ?,
+            updated_at = ?
+        """,
+        (ticker, current_price, change_percent, currency, updated_at,
+         current_price, change_percent, currency, updated_at)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_update_time():
+    """Haalt de laatste update tijd op van alle gecachte prijzen."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(updated_at) FROM price_cache")
+    result = cursor.fetchone()
+    conn.close()
+
+    if result and result[0]:
+        return result[0]
+    return None
 
 
 def add_dividend(ticker, isin, ex_date, bruto_amount, notes="", currency="EUR", tax_paid=True, received=False):
@@ -229,14 +297,23 @@ def get_yahoo_ticker_from_isin(isin):
         return None
 
 
-def get_current_price(ticker, isin=None):
+def get_current_price(ticker, isin=None, refresh=False):
     """
     Haalt de huidige prijs op voor een ticker via yfinance API.
     Als ISIN gegeven is, wordt eerst de juiste Yahoo ticker bepaald.
     Retourneert dict met current_price, change_percent, currency.
+
+    Als refresh=False, wordt eerst in de cache gekeken.
+    Als refresh=True, wordt altijd de API bevraagd en cache geupdate.
     """
     if not ticker:
         return None
+
+    # Check cache als refresh niet expliciet gevraagd is
+    if not refresh:
+        cached = get_cached_price(ticker)
+        if cached:
+            return cached
 
     # Probeer eerst de juiste ticker te krijgen via ISIN als deze beschikbaar is
     yahoo_ticker = ticker
@@ -260,12 +337,17 @@ def get_current_price(ticker, isin=None):
             else:
                 change_percent = 0
 
-            return {
+            result = {
                 'current_price': float(current_price),
                 'change_percent': float(change_percent),
                 'currency': 'EUR',  # Default to EUR for European stocks
                 'name': ticker
             }
+
+            # Sla op in cache
+            save_price_to_cache(ticker, result['current_price'], result['change_percent'], result['currency'])
+
+            return result
 
         # Fallback naar info als history niet werkt
         info = stock.info
@@ -277,14 +359,23 @@ def get_current_price(ticker, isin=None):
         change_percent = info.get('regularMarketChangePercent', 0)
         currency = info.get('currency', 'EUR')
 
-        return {
+        result = {
             'current_price': float(current_price),
             'change_percent': float(change_percent) if change_percent else 0,
             'currency': currency,
             'name': info.get('longName', info.get('shortName', ticker))
         }
 
+        # Sla op in cache
+        save_price_to_cache(ticker, result['current_price'], result['change_percent'], result['currency'])
+
+        return result
+
     except Exception as e:
+        # Bij error, probeer cache als fallback
+        cached = get_cached_price(ticker)
+        if cached:
+            return cached
         return {"error": f"Fout bij ophalen prijs: {str(e)}"}
 
 
@@ -323,9 +414,46 @@ if holdings.empty:
     st.info("Je portfolio is nog leeg. Voeg eerst transacties toe op de hoofdpagina.")
     st.stop()
 
-# Initialize session state voor geselecteerd aandeel
+# Toon laatste update tijd en refresh knop
+col1, col2, col3 = st.columns([2, 1, 1])
+
+with col1:
+    last_update = get_last_update_time()
+    if last_update:
+        try:
+            last_update_dt = datetime.fromisoformat(last_update)
+            time_ago = datetime.now() - last_update_dt
+
+            if time_ago.days > 0:
+                time_str = f"{time_ago.days} dag(en) geleden"
+            elif time_ago.seconds > 3600:
+                time_str = f"{time_ago.seconds // 3600} uur geleden"
+            else:
+                time_str = f"{time_ago.seconds // 60} minuten geleden"
+
+            st.info(f"📅 Laatste koers update: {last_update_dt.strftime('%d-%m-%Y %H:%M')} ({time_str})")
+        except:
+            st.info("📅 Laatste koers update: Onbekend")
+    else:
+        st.info("📅 Koersen nog niet opgehaald")
+
+with col2:
+    st.write("")  # Spacer
+
+with col3:
+    st.write("")  # Spacer
+    st.write("")  # Spacer
+    if st.button("🔄 Ververs Koersen", type="primary", use_container_width=True):
+        st.session_state['refresh_prices'] = True
+        st.rerun()
+
+# Initialize session state voor geselecteerd aandeel en refresh flag
 if 'selected_ticker' not in st.session_state:
     st.session_state.selected_ticker = None
+
+refresh_prices = st.session_state.get('refresh_prices', False)
+if refresh_prices:
+    st.session_state['refresh_prices'] = False  # Reset flag
 
 # Toon portfolio overzicht
 st.subheader("Jouw Holdings")
@@ -333,13 +461,15 @@ st.subheader("Jouw Holdings")
 # Bereken totalen
 portfolio_data = []
 
-with st.spinner("Huidige prijzen ophalen..."):
+spinner_text = "Koersen verversen..." if refresh_prices else "Huidige prijzen ophalen..."
+with st.spinner(spinner_text):
     for idx, row in holdings.iterrows():
         ticker = row['ticker']
         isin = row['isin']
 
         # Haal huidige prijs op (met ISIN voor juiste ticker lookup)
-        price_info = get_current_price(ticker, isin)
+        # refresh=True als de refresh knop is ingedrukt
+        price_info = get_current_price(ticker, isin, refresh=refresh_prices)
 
         if price_info and 'error' not in price_info:
             current_price = price_info['current_price']
