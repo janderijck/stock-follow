@@ -1,9 +1,11 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
+import requests
 from pathlib import Path
 
 DB_PATH = Path("data.db")
+OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
 
 
 # --------- Database helpers ---------
@@ -129,6 +131,65 @@ def load_transactions():
     conn.close()
     return df
 
+
+# --------- ISIN Lookup ---------
+def lookup_isin(isin_code):
+    """
+    Zoekt aandeel informatie op basis van ISIN via OpenFIGI API.
+    Retourneert dict met name, ticker, exchange, currency.
+    """
+    if not isin_code or len(isin_code.strip()) == 0:
+        return None
+
+    try:
+        headers = {'Content-Type': 'application/json'}
+        jobs = [{'idType': 'ID_ISIN', 'idValue': isin_code.strip().upper()}]
+
+        response = requests.post(
+            url=OPENFIGI_URL,
+            headers=headers,
+            json=jobs,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return {"error": f"API error: status {response.status_code}"}
+
+        data = response.json()
+
+        # Check if we got results
+        if not data or len(data) == 0:
+            return {"error": "Geen resultaten gevonden"}
+
+        first_result = data[0]
+
+        # Check for error in response
+        if 'error' in first_result:
+            return {"error": f"ISIN niet gevonden: {first_result.get('error', 'Unknown error')}"}
+
+        # Extract data from first match
+        if 'data' in first_result and len(first_result['data']) > 0:
+            security = first_result['data'][0]
+
+            return {
+                'name': security.get('name', ''),
+                'ticker': security.get('ticker', ''),
+                'exchange': security.get('exchCode', ''),
+                'currency': security.get('marketSector', '').split()[0] if security.get('marketSector') else 'EUR',
+                'security_type': security.get('securityType', ''),
+                'market_sector': security.get('marketSector', '')
+            }
+        else:
+            return {"error": "Geen data beschikbaar voor dit ISIN"}
+
+    except requests.exceptions.Timeout:
+        return {"error": "API timeout - probeer het opnieuw"}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Netwerk error: {str(e)}"}
+    except Exception as e:
+        return {"error": f"Onverwachte fout: {str(e)}"}
+
+
 # --------- Streamlit UI ---------
 st.set_page_config(page_title="Portfolio tracker", page_icon="📈")
 
@@ -137,6 +198,51 @@ migrate_database()
 
 st.title("Transactie invoeren")
 
+# Initialize session state
+if 'security_data' not in st.session_state:
+    st.session_state.security_data = {}
+
+# ISIN Lookup Section
+st.subheader("ISIN Opzoeken")
+col_lookup1, col_lookup2 = st.columns([3, 1])
+
+with col_lookup1:
+    isin_lookup = st.text_input(
+        "Voer ISIN in om automatisch gegevens op te halen",
+        key="isin_lookup_input",
+        placeholder="Bv. US0378331005 (Apple)"
+    )
+
+with col_lookup2:
+    st.write("")  # Spacing
+    st.write("")  # Spacing
+    if st.button("🔍 Opzoeken", type="primary"):
+        if isin_lookup:
+            with st.spinner("Gegevens ophalen..."):
+                result = lookup_isin(isin_lookup)
+
+                if result and 'error' not in result:
+                    st.session_state.security_data = {
+                        'name': result.get('name', ''),
+                        'ticker': result.get('ticker', ''),
+                        'isin': isin_lookup.upper(),
+                        'currency': result.get('currency', 'EUR')
+                    }
+                    st.success(f"✓ Gevonden: {result.get('name', 'Unknown')} ({result.get('ticker', 'N/A')})")
+                elif result and 'error' in result:
+                    st.error(result['error'])
+                else:
+                    st.error("Kon geen informatie ophalen voor dit ISIN")
+        else:
+            st.warning("Voer eerst een ISIN in")
+
+# Show current loaded data
+if st.session_state.security_data:
+    st.info(f"📊 Geladen: {st.session_state.security_data.get('name', 'N/A')} - {st.session_state.security_data.get('ticker', 'N/A')}")
+
+st.divider()
+
+# Transaction Form
 with st.form("new_transaction"):
     col1, col2, col3 = st.columns(3)
 
@@ -144,11 +250,23 @@ with st.form("new_transaction"):
         date = st.date_input("Datum")
         broker = st.text_input("Broker (bv. DEGIRO)")
         transaction_type = st.selectbox("Type", ["BUY", "SELL"])
-        name = st.text_input("Naam aandeel")
+        name = st.text_input(
+            "Naam aandeel",
+            value=st.session_state.security_data.get('name', ''),
+            key="name_input"
+        )
 
     with col2:
-        ticker = st.text_input("Ticker (bv. AAPL)")
-        isin = st.text_input("ISIN")
+        ticker = st.text_input(
+            "Ticker (bv. AAPL)",
+            value=st.session_state.security_data.get('ticker', ''),
+            key="ticker_input"
+        )
+        isin = st.text_input(
+            "ISIN",
+            value=st.session_state.security_data.get('isin', ''),
+            key="isin_input"
+        )
         quantity = st.number_input("Aantal aandelen", min_value=1, step=1)
         price_per_share = st.number_input(
             "Prijs per aandeel",
@@ -158,7 +276,17 @@ with st.form("new_transaction"):
         )
 
     with col3:
-        currency = st.selectbox("Valuta", ["EUR", "USD", "GBP"])
+        # Get currency from session state or default to EUR
+        default_currency = st.session_state.security_data.get('currency', 'EUR')
+        currency_options = ["EUR", "USD", "GBP"]
+        if default_currency not in currency_options:
+            default_currency = "EUR"
+
+        currency = st.selectbox(
+            "Valuta",
+            currency_options,
+            index=currency_options.index(default_currency)
+        )
         fees = st.number_input(
             "Kosten (broker + taksen)",
             min_value=0.0,
@@ -174,7 +302,7 @@ with st.form("new_transaction"):
         )
         notes = st.text_area("Notities (optioneel)", height=100)
 
-    submitted = st.form_submit_button("Opslaan")
+    submitted = st.form_submit_button("💾 Opslaan")
 
 
 if submitted:
@@ -182,7 +310,9 @@ if submitted:
         st.error("Vul alle verplichte velden in.")
     else:
         insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
-        st.success("Transactie opgeslagen.")
+        st.success("✓ Transactie opgeslagen.")
+        # Clear session state after saving
+        st.session_state.security_data = {}
 
 
 st.subheader("Bewaarde transacties")
