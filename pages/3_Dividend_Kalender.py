@@ -841,7 +841,7 @@ with tab1:
                         tax_label = 'Tax (US+BE)'
 
             display_data.append({
-                'Ex-Dividend Datum': row['ex_date'].strftime('%Y-%m-%d'),
+                'Ex-Dividend Datum': row['ex_date'].strftime('%d/%m/%Y'),
                 'Aandeel': row['name'] if pd.notna(row['name']) else row['ticker'],
                 'Ticker': row['ticker'],
                 'Currency': currency,
@@ -1280,7 +1280,7 @@ with tab3:
                 predictions.append({
                     'Aandeel': name,
                     'Ticker': ticker,
-                    'Voorspelde Datum': prediction['predicted_date'].strftime('%Y-%m-%d'),
+                    'Voorspelde Datum': prediction['predicted_date'].strftime('%d/%m/%Y'),
                     'Gemiddeld Interval': f"{prediction['avg_interval_days']} dagen",
                     'Laatste Bedrag': f"€{prediction['last_amount']:.2f}",
                     'Dagen tot uitkering': (prediction['predicted_date'] - datetime.now()).days
@@ -1343,7 +1343,7 @@ with tab4:
 
             ticker_input = st.text_input("Ticker", value=default_ticker, disabled=bool(default_ticker))
             isin_input = st.text_input("ISIN", value=default_isin, disabled=bool(default_isin))
-            ex_date_input = st.date_input("Ex-Dividend Datum")
+            ex_date_input = st.date_input("Ex-Dividend Datum", format="DD/MM/YYYY")
 
         with col2:
             bruto_amount_input = st.number_input(
@@ -1434,7 +1434,7 @@ with tab4:
                 net_received=final_net_received
             )
 
-            st.success(f"✓ Dividend toegevoegd voor {ticker_input} op {ex_date_input.strftime('%Y-%m-%d')}")
+            st.success(f"✓ Dividend toegevoegd voor {ticker_input} op {ex_date_input.strftime('%d/%m/%Y')}")
             st.info("💡 Bekijk het dividend in de Overzicht of Kalender View tabs")
             st.rerun()
 
@@ -1515,7 +1515,7 @@ with tab5:
                     else:
                         time_str = f"{time_ago.seconds // 60} minuten geleden"
 
-                    st.caption(f"📅 Laatst opgehaald: {last_updated_dt.strftime('%Y-%m-%d %H:%M:%S')} ({time_str})")
+                    st.caption(f"📅 Laatst opgehaald: {last_updated_dt.strftime('%d/%m/%Y %H:%M:%S')} ({time_str})")
 
             st.divider()
 
@@ -1593,7 +1593,7 @@ with tab5:
                     display_data = cached_data.copy()
 
                 # Format de data voor display
-                display_data['fetched_at_formatted'] = pd.to_datetime(display_data['fetched_at']).dt.strftime('%Y-%m-%d %H:%M')
+                display_data['fetched_at_formatted'] = pd.to_datetime(display_data['fetched_at']).dt.strftime('%d/%m/%Y %H:%M')
                 display_data['amount_formatted'] = display_data.apply(
                     lambda row: format_currency(row['amount'], row.get('currency', 'USD')),
                     axis=1

@@ -22,11 +22,18 @@ def get_connection():
             country TEXT NOT NULL,
             has_w8ben INTEGER DEFAULT 0,
             w8ben_expiry_date TEXT,
+            historical_costs REAL DEFAULT 0,
             notes TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
+
+    # Voeg historical_costs kolom toe als die nog niet bestaat
+    try:
+        conn.execute("ALTER TABLE broker_settings ADD COLUMN historical_costs REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Kolom bestaat al
 
     # Maak stock_info tabel voor asset type tracking
     conn.execute("""
@@ -37,9 +44,26 @@ def get_connection():
             name TEXT,
             asset_type TEXT DEFAULT 'STOCK',
             country TEXT,
+            yahoo_ticker TEXT,
             notes TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Voeg yahoo_ticker kolom toe als die nog niet bestaat
+    try:
+        conn.execute("ALTER TABLE stock_info ADD COLUMN yahoo_ticker TEXT")
+    except sqlite3.OperationalError:
+        pass  # Kolom bestaat al
+
+    # Maak api_settings tabel voor API keys
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_settings (
+            id INTEGER PRIMARY KEY,
+            setting_key TEXT NOT NULL UNIQUE,
+            setting_value TEXT,
+            updated_at TEXT
         )
     """)
 
@@ -110,7 +134,7 @@ def get_all_brokers():
     """Haal alle broker configuraties op."""
     conn = get_connection()
     df = pd.read_sql_query("""
-        SELECT id, broker_name, country, has_w8ben, w8ben_expiry_date, notes, updated_at
+        SELECT id, broker_name, country, has_w8ben, w8ben_expiry_date, historical_costs, notes, updated_at
         FROM broker_settings
         ORDER BY broker_name
     """, conn)
@@ -118,7 +142,7 @@ def get_all_brokers():
     return df
 
 
-def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, notes=""):
+def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, historical_costs=0, notes=""):
     """Voeg een nieuwe broker toe."""
     conn = get_connection()
     cursor = conn.cursor()
@@ -126,9 +150,9 @@ def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, notes=""
 
     try:
         cursor.execute("""
-            INSERT INTO broker_settings (broker_name, country, has_w8ben, w8ben_expiry_date, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, notes, now, now))
+            INSERT INTO broker_settings (broker_name, country, has_w8ben, w8ben_expiry_date, historical_costs, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, float(historical_costs), notes, now, now))
         conn.commit()
         conn.close()
         return True
@@ -137,7 +161,7 @@ def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, notes=""
         return False
 
 
-def update_broker(broker_id, broker_name, country, has_w8ben, w8ben_expiry_date=None, notes=""):
+def update_broker(broker_id, broker_name, country, has_w8ben, w8ben_expiry_date=None, historical_costs=0, notes=""):
     """Update een bestaande broker."""
     conn = get_connection()
     cursor = conn.cursor()
@@ -145,9 +169,9 @@ def update_broker(broker_id, broker_name, country, has_w8ben, w8ben_expiry_date=
 
     cursor.execute("""
         UPDATE broker_settings
-        SET broker_name = ?, country = ?, has_w8ben = ?, w8ben_expiry_date = ?, notes = ?, updated_at = ?
+        SET broker_name = ?, country = ?, has_w8ben = ?, w8ben_expiry_date = ?, historical_costs = ?, notes = ?, updated_at = ?
         WHERE id = ?
-    """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, notes, now, broker_id))
+    """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, float(historical_costs), notes, now, broker_id))
 
     conn.commit()
     conn.close()
@@ -162,12 +186,96 @@ def delete_broker(broker_id):
     conn.close()
 
 
+def get_api_setting(key):
+    """Haal een API setting op."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT setting_value FROM api_settings WHERE setting_key = ?", (key,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+def set_api_setting(key, value):
+    """Sla een API setting op."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute("""
+        INSERT INTO api_settings (setting_key, setting_value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(setting_key) DO UPDATE SET
+            setting_value = ?, updated_at = ?
+    """, (key, value, now, value, now))
+    conn.commit()
+    conn.close()
+
+
+def get_manual_prices():
+    """Haal alle handmatig ingestelde prijzen op."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Maak tabel als die niet bestaat
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS manual_prices (
+            ticker TEXT PRIMARY KEY,
+            price REAL NOT NULL,
+            currency TEXT DEFAULT 'EUR',
+            updated_at TEXT
+        )
+    """)
+    conn.commit()
+
+    df = pd.read_sql_query("SELECT * FROM manual_prices ORDER BY ticker", conn)
+    conn.close()
+    return df
+
+
+def set_manual_price(ticker, price, currency='EUR'):
+    """Stel een handmatige prijs in voor een ticker."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+
+    cursor.execute("""
+        INSERT INTO manual_prices (ticker, price, currency, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            price = ?, currency = ?, updated_at = ?
+    """, (ticker, price, currency, now, price, currency, now))
+
+    conn.commit()
+    conn.close()
+
+
+def delete_manual_price(ticker):
+    """Verwijder een handmatige prijs."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM manual_prices WHERE ticker = ?", (ticker,))
+    conn.commit()
+    conn.close()
+
+
+def get_portfolio_tickers():
+    """Haal alle tickers op uit de portfolio."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DISTINCT ticker, name FROM transactions ORDER BY name
+    """)
+    result = cursor.fetchall()
+    conn.close()
+    return result
+
+
 def get_all_stocks():
     """Haal alle stock configuraties op."""
     conn = get_connection()
     df = pd.read_sql_query("""
         SELECT si.id, si.ticker, si.isin, si.name, si.asset_type, si.country,
-               si.custom_dividend_tax_rate, si.notes
+               si.custom_dividend_tax_rate, si.yahoo_ticker, si.notes
         FROM stock_info si
         ORDER BY si.ticker
     """, conn)
@@ -175,7 +283,7 @@ def get_all_stocks():
     return df
 
 
-def add_or_update_stock(ticker, isin, name, asset_type, country, notes="", custom_tax_rate=None):
+def add_or_update_stock(ticker, isin, name, asset_type, country, notes="", custom_tax_rate=None, yahoo_ticker=None):
     """Voeg een stock toe of update bestaande."""
     conn = get_connection()
     cursor = conn.cursor()
@@ -189,15 +297,15 @@ def add_or_update_stock(ticker, isin, name, asset_type, country, notes="", custo
         cursor.execute("""
             UPDATE stock_info
             SET isin = ?, name = ?, asset_type = ?, country = ?,
-                custom_dividend_tax_rate = ?, notes = ?, updated_at = ?
+                custom_dividend_tax_rate = ?, yahoo_ticker = ?, notes = ?, updated_at = ?
             WHERE ticker = ?
-        """, (isin, name, asset_type, country, custom_tax_rate, notes, now, ticker))
+        """, (isin, name, asset_type, country, custom_tax_rate, yahoo_ticker, notes, now, ticker))
     else:
         cursor.execute("""
             INSERT INTO stock_info (ticker, isin, name, asset_type, country,
-                                   custom_dividend_tax_rate, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (ticker, isin, name, asset_type, country, custom_tax_rate, notes, now, now))
+                                   custom_dividend_tax_rate, yahoo_ticker, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, isin, name, asset_type, country, custom_tax_rate, yahoo_ticker, notes, now, now))
 
     conn.commit()
     conn.close()
@@ -233,7 +341,7 @@ st.title("⚙️ Broker & Tax Settings")
 st.write("Configureer je broker settings en belastingtarieven voor accurate dividend berekeningen")
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["🏦 Broker Settings", "📊 Stock/Asset Types", "💰 Tax Rates"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏦 Broker Settings", "📊 Stock/Asset Types", "💰 Tax Rates", "🔑 API Settings", "💵 Handmatige Prijzen"])
 
 # Tab 1: Broker Settings
 with tab1:
@@ -254,7 +362,15 @@ with tab1:
         with col2:
             w8ben_expiry = None
             if has_w8ben:
-                w8ben_expiry = st.date_input("W-8BEN vervaldatum", help="W-8BEN is normaal 3 jaar geldig")
+                w8ben_expiry = st.date_input("W-8BEN vervaldatum", help="W-8BEN is normaal 3 jaar geldig", format="DD/MM/YYYY")
+            historical_costs = st.number_input(
+                "Historische kosten (€)",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Transactiekosten van voor de app, om mee te rekenen in cash balans"
+            )
             notes = st.text_area("Notities (optioneel)")
 
         submit = st.form_submit_button("💾 Broker Opslaan", type="primary")
@@ -262,7 +378,7 @@ with tab1:
         if submit:
             if broker_name:
                 expiry_str = w8ben_expiry.isoformat() if w8ben_expiry else None
-                if add_broker(broker_name, country, has_w8ben, expiry_str, notes):
+                if add_broker(broker_name, country, has_w8ben, expiry_str, historical_costs, notes):
                     st.success(f"✓ Broker '{broker_name}' toegevoegd!")
                     st.rerun()
                 else:
@@ -281,35 +397,50 @@ with tab1:
         st.info("Nog geen brokers geconfigureerd. Voeg er hierboven een toe!")
     else:
         for idx, row in brokers_df.iterrows():
+            broker_id = row['id']
             with st.expander(f"🏦 {row['broker_name']} ({row['country']})", expanded=False):
-                col1, col2, col3 = st.columns([2, 2, 1])
+                with st.form(f"edit_broker_{broker_id}"):
+                    col1, col2 = st.columns(2)
 
-                with col1:
-                    st.write(f"**Land:** {row['country']}")
-                    w8_status = "✅ Actief" if row['has_w8ben'] else "❌ Niet actief"
-                    st.write(f"**W-8BEN:** {w8_status}")
+                    with col1:
+                        edit_broker_name = st.text_input("Broker naam", value=row['broker_name'], key=f"name_{broker_id}")
+                        country_options = ["België", "Nederland", "Verenigde Staten", "Verenigd Koninkrijk", "Andere"]
+                        current_country = row['country']
+                        country_idx = country_options.index(current_country) if current_country in country_options else 4
+                        edit_country = st.selectbox("Land", country_options, index=country_idx, key=f"country_{broker_id}")
+                        edit_w8ben = st.checkbox("W-8BEN formulier actief", value=bool(row['has_w8ben']), key=f"w8ben_{broker_id}")
 
-                    if row['has_w8ben'] and row['w8ben_expiry_date']:
-                        expiry = pd.to_datetime(row['w8ben_expiry_date'])
-                        days_until_expiry = (expiry - pd.Timestamp.now()).days
-
-                        if days_until_expiry < 0:
-                            st.error(f"⚠️ W-8BEN verlopen op {expiry.strftime('%Y-%m-%d')}")
-                        elif days_until_expiry < 90:
-                            st.warning(f"⚠️ W-8BEN verloopt over {days_until_expiry} dagen ({expiry.strftime('%Y-%m-%d')})")
+                    with col2:
+                        if row['w8ben_expiry_date']:
+                            expiry_value = pd.to_datetime(row['w8ben_expiry_date']).date()
                         else:
-                            st.info(f"Geldig tot {expiry.strftime('%Y-%m-%d')}")
+                            expiry_value = datetime.now().date()
+                        edit_w8ben_expiry = st.date_input("W-8BEN vervaldatum", value=expiry_value, key=f"expiry_{broker_id}", format="DD/MM/YYYY")
 
-                with col2:
-                    if row['notes']:
-                        st.write(f"**Notities:** {row['notes']}")
-                    st.caption(f"Laatst bijgewerkt: {pd.to_datetime(row['updated_at']).strftime('%Y-%m-%d %H:%M')}")
+                        hist_costs = row.get('historical_costs', 0) or 0
+                        edit_hist_costs = st.number_input(
+                            "Historische kosten (€)",
+                            min_value=0.0,
+                            value=float(hist_costs),
+                            step=0.01,
+                            format="%.2f",
+                            key=f"hist_{broker_id}",
+                            help="Transactiekosten van voor de app"
+                        )
+                        edit_notes = st.text_area("Notities", value=row['notes'] or "", key=f"notes_{broker_id}", height=68)
 
-                with col3:
-                    if st.button("🗑️ Verwijder", key=f"delete_broker_{row['id']}", type="secondary"):
-                        delete_broker(row['id'])
-                        st.success("✓ Broker verwijderd")
-                        st.rerun()
+                    col_save, col_delete = st.columns(2)
+                    with col_save:
+                        if st.form_submit_button("💾 Opslaan", type="primary", use_container_width=True):
+                            expiry_str = edit_w8ben_expiry.isoformat() if edit_w8ben else None
+                            update_broker(broker_id, edit_broker_name, edit_country, edit_w8ben, expiry_str, edit_hist_costs, edit_notes)
+                            st.success("✓ Broker bijgewerkt!")
+                            st.rerun()
+                    with col_delete:
+                        if st.form_submit_button("🗑️ Verwijder", type="secondary", use_container_width=True):
+                            delete_broker(broker_id)
+                            st.success("✓ Broker verwijderd")
+                            st.rerun()
 
 # Tab 2: Stock/Asset Types
 with tab2:
@@ -552,6 +683,122 @@ with tab3:
         st.write("**Huidige tarieven:**")
         st.write(f"- Met W-8BEN: {us_with_w8 * 100:.1f}%")
         st.write(f"- Zonder W-8BEN: {us_without_w8 * 100:.1f}%")
+
+# Tab 4: API Settings
+with tab4:
+    st.subheader("API Configuratie")
+    st.write("Configureer API keys voor externe koersdatabronnen.")
+
+    st.info("""
+    **Hoe het werkt:**
+    1. Eerst wordt Yahoo Finance geprobeerd (gratis, geen key nodig)
+    2. Als Yahoo faalt, wordt Marketstack gebruikt (als key ingesteld)
+
+    Marketstack heeft betere Europese dekking en kan zoeken op ISIN.
+    """)
+
+    st.divider()
+
+    st.write("### Marketstack API")
+    st.write("Krijg een gratis API key op: https://marketstack.com/signup/free")
+
+    current_key = get_api_setting('marketstack_api_key') or ''
+
+    with st.form("marketstack_form"):
+        api_key = st.text_input(
+            "Marketstack API Key",
+            value=current_key,
+            type="password",
+            help="Je Marketstack API key (gratis tier: 100 calls/maand)"
+        )
+
+        if st.form_submit_button("💾 Opslaan", type="primary"):
+            set_api_setting('marketstack_api_key', api_key.strip())
+            st.success("✓ API key opgeslagen")
+            st.rerun()
+
+    if current_key:
+        st.success("✅ Marketstack API key is geconfigureerd")
+    else:
+        st.warning("⚠️ Geen Marketstack API key ingesteld - alleen Yahoo Finance wordt gebruikt")
+
+# Tab 5: Handmatige Prijzen
+with tab5:
+    st.subheader("Handmatige Prijzen")
+    st.write("Stel handmatig prijzen in voor aandelen die niet correct worden opgehaald via API's.")
+
+    st.info("""
+    **Wanneer te gebruiken:**
+    - ETFs die niet op Yahoo Finance staan in EUR
+    - Aandelen met verkeerde prijzen
+    - Belgische/Nederlandse aandelen zonder API dekking
+
+    Handmatige prijzen hebben **prioriteit** boven API prijzen.
+    """)
+
+    st.divider()
+
+    # Nieuwe prijs toevoegen
+    st.write("### Nieuwe Prijs Instellen")
+
+    portfolio_tickers = get_portfolio_tickers()
+
+    if portfolio_tickers:
+        with st.form("add_manual_price"):
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                ticker_options = [f"{t[0]} - {t[1]}" for t in portfolio_tickers]
+                selected = st.selectbox("Aandeel", ticker_options)
+                selected_ticker = selected.split(" - ")[0] if selected else ""
+
+            with col2:
+                price = st.number_input("Prijs", min_value=0.0, step=0.01, format="%.2f")
+
+            with col3:
+                currency = st.selectbox("Valuta", ["EUR", "USD", "GBP"])
+
+            if st.form_submit_button("💾 Opslaan", type="primary"):
+                if selected_ticker and price > 0:
+                    set_manual_price(selected_ticker, price, currency)
+                    st.success(f"✓ Prijs voor {selected_ticker} ingesteld op {currency} {price:.2f}")
+                    st.rerun()
+                else:
+                    st.error("Selecteer een aandeel en vul een prijs in")
+    else:
+        st.warning("Geen aandelen in portfolio. Voeg eerst transacties toe.")
+
+    st.divider()
+
+    # Bestaande handmatige prijzen
+    st.write("### Ingestelde Prijzen")
+
+    manual_prices = get_manual_prices()
+
+    if manual_prices.empty:
+        st.info("Nog geen handmatige prijzen ingesteld.")
+    else:
+        for _, row in manual_prices.iterrows():
+            col1, col2, col3 = st.columns([3, 2, 1])
+
+            with col1:
+                st.write(f"**{row['ticker']}**")
+
+            with col2:
+                symbol = '€' if row['currency'] == 'EUR' else '$' if row['currency'] == 'USD' else '£'
+                st.write(f"{symbol}{row['price']:.2f}")
+
+            with col3:
+                if st.button("🗑️", key=f"del_manual_{row['ticker']}", help="Verwijder"):
+                    delete_manual_price(row['ticker'])
+                    st.rerun()
+
+            # Toon laatste update
+            if row['updated_at']:
+                updated = pd.to_datetime(row['updated_at']).strftime('%d/%m/%Y %H:%M')
+                st.caption(f"Laatst bijgewerkt: {updated}")
+
+            st.divider()
 
 st.divider()
 

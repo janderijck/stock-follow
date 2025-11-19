@@ -35,9 +35,19 @@ def get_connection():
         price_per_share REAL NOT NULL,
         currency TEXT NOT NULL,
         fees REAL NOT NULL,
+        taxes REAL DEFAULT 0,
         exchange_rate REAL DEFAULT 1.0,
         notes TEXT
     );
+    """)
+
+    # Voeg taxes kolom toe als die nog niet bestaat
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN taxes REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Kolom bestaat al
+
+    conn.executescript("""
 
     CREATE TABLE IF NOT EXISTS dividends (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,14 +133,18 @@ def get_all_purchases(ticker):
     query = """
     SELECT
         id,
-        date as Datum,
+        strftime('%d/%m/%Y', date) as Datum,
+        date as date,
         broker as Broker,
         transaction_type as Type,
         quantity as Aantal,
         price_per_share as 'Prijs/stuk',
         currency as Valuta,
         fees as Kosten,
-        (quantity * price_per_share + fees) as Totaal,
+        COALESCE(taxes, 0) as Taxen,
+        COALESCE(exchange_rate, 1.0) as Wisselkoers,
+        (quantity * price_per_share) as TotaalAankoop,
+        (quantity * price_per_share + fees + COALESCE(taxes, 0)) as Totaal,
         notes as Notities
     FROM transactions
     WHERE ticker = ?
@@ -246,8 +260,8 @@ def get_manual_dividends(ticker, filter_ownership=False):
                 last_sale_dt = pd.to_datetime(last_sale)
                 df = df[df['ex_date'] <= last_sale_dt]
 
-            # Convert ex_date terug naar string voor display
-            df['ex_date'] = df['ex_date'].dt.strftime('%Y-%m-%d')
+            # Convert ex_date terug naar string voor display (dd/mm/yyyy)
+            df['ex_date'] = df['ex_date'].dt.strftime('%d/%m/%Y')
 
     return df
 
@@ -257,6 +271,22 @@ def delete_dividend(dividend_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM dividends WHERE id = ?", (dividend_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_dividend(dividend_id, ex_date, bruto_amount, currency, tax_paid, received, notes=""):
+    """Update een bestaand dividend."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE dividends
+        SET ex_date = ?, bruto_amount = ?, currency = ?, tax_paid = ?, received = ?, notes = ?
+        WHERE id = ?
+        """,
+        (ex_date.isoformat(), float(bruto_amount), currency, 1 if tax_paid else 0, 1 if received else 0, notes, dividend_id)
+    )
     conn.commit()
     conn.close()
 
@@ -349,19 +379,63 @@ def get_current_price(ticker, isin=None):
     return None
 
 
-def insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate=1.0, notes=""):
+def insert_transaction(date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, taxes=0, exchange_rate=1.0, notes=""):
     """Voegt een transactie toe aan de database."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO transactions (date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, exchange_rate, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (date, broker, transaction_type, name, ticker, isin, quantity, price_per_share, currency, fees, taxes, exchange_rate, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (date.isoformat(), broker, transaction_type, name, ticker.upper(), isin.upper(), int(quantity), float(price_per_share), currency, float(fees), float(exchange_rate), notes),
+        (date.isoformat(), broker, transaction_type, name, ticker.upper(), isin.upper(), int(quantity), float(price_per_share), currency, float(fees), float(taxes), float(exchange_rate), notes),
     )
     conn.commit()
     conn.close()
+
+
+def update_transaction(transaction_id, date, broker, transaction_type, quantity, price_per_share, currency, fees, taxes=0, exchange_rate=1.0, notes=""):
+    """Update een bestaande transactie."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE transactions
+        SET date = ?, broker = ?, transaction_type = ?, quantity = ?,
+            price_per_share = ?, currency = ?, fees = ?, taxes = ?, exchange_rate = ?, notes = ?
+        WHERE id = ?
+        """,
+        (date.isoformat(), broker, transaction_type, int(quantity), float(price_per_share),
+         currency, float(fees), float(taxes), float(exchange_rate), notes, transaction_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_transaction(transaction_id):
+    """Verwijdert een transactie."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_transaction_by_id(transaction_id):
+    """Haalt een specifieke transactie op."""
+    conn = get_connection()
+    query = """
+    SELECT id, date, broker, transaction_type, name, ticker, isin,
+           quantity, price_per_share, currency, fees, COALESCE(taxes, 0) as taxes, exchange_rate, notes
+    FROM transactions
+    WHERE id = ?
+    """
+    df = pd.read_sql_query(query, conn, params=(transaction_id,))
+    conn.close()
+
+    if not df.empty:
+        return df.iloc[0]
+    return None
 
 
 def get_available_brokers():
@@ -476,13 +550,8 @@ with tab1:
     purchases_df = get_all_purchases(ticker)
 
     if not purchases_df.empty:
-        # Toon tabel zonder ID kolom
-        display_df = purchases_df.drop(columns=['id'])
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        # Statistieken
-        st.divider()
-        col1, col2, col3 = st.columns(3)
+        # Statistieken bovenaan
+        col1, col2, col3, col4 = st.columns(4)
 
         with col1:
             buy_count = len(purchases_df[purchases_df['Type'] == 'BUY'])
@@ -495,6 +564,185 @@ with tab1:
         with col3:
             total_fees = purchases_df['Kosten'].sum()
             st.metric("Totale kosten", f"€{total_fees:.2f}")
+
+        with col4:
+            total_taxes = purchases_df['Taxen'].sum()
+            st.metric("Totale taxen", f"€{total_taxes:.2f}")
+
+        st.divider()
+
+        # Initialize edit state
+        if 'editing_transaction' not in st.session_state:
+            st.session_state.editing_transaction = None
+
+        # Header rij
+        header_col1, header_col2, header_col3, header_col4, header_col5, header_col6, header_col7 = st.columns([1.5, 1, 1, 1.2, 1.2, 1.5, 0.5])
+        with header_col1:
+            st.markdown("**Datum**")
+        with header_col2:
+            st.markdown("**Type**")
+        with header_col3:
+            st.markdown("**Aantal**")
+        with header_col4:
+            st.markdown("**Prijs/stuk**")
+        with header_col5:
+            st.markdown("**Kosten + Tax**")
+        with header_col6:
+            st.markdown("**Totaal (Broker)**")
+        with header_col7:
+            st.markdown("")
+
+        st.divider()
+
+        # Toon elke transactie als een rij met edit knop
+        for idx, row in purchases_df.iterrows():
+            tx_id = row['id']
+            is_editing = st.session_state.editing_transaction == tx_id
+
+            if not is_editing:
+                # View mode - toon transactie met edit knop
+                currency = row.get('Valuta', 'EUR')
+                currency_symbol = '$' if currency == 'USD' else '€' if currency == 'EUR' else '£' if currency == 'GBP' else currency
+                taxes = row.get('Taxen', 0)
+                fees = row.get('Kosten', 0)
+
+                col1, col2, col3, col4, col5, col6, col7 = st.columns([1.5, 1, 1, 1.2, 1.2, 1.5, 0.5])
+
+                with col1:
+                    st.write(f"**{row['Datum']}**")
+                with col2:
+                    type_emoji = "🟢" if row['Type'] == 'BUY' else "🔴"
+                    st.write(f"{type_emoji} {row['Type']}")
+                with col3:
+                    st.write(f"{row['Aantal']} st")
+                with col4:
+                    # Prijs in originele valuta
+                    st.write(f"{currency_symbol}{row['Prijs/stuk']:.2f}")
+                with col5:
+                    # Kosten en taxen apart
+                    st.write(f"€{fees:.2f} + €{taxes:.2f}")
+                with col6:
+                    # Totaal aankoop in originele valuta
+                    st.write(f"**{currency_symbol}{row['TotaalAankoop']:.2f}** ({row['Broker']})")
+                with col7:
+                    if st.button("✏️", key=f"edit_{tx_id}", help="Bewerk transactie"):
+                        st.session_state.editing_transaction = tx_id
+                        st.rerun()
+
+                st.divider()
+
+            else:
+                # Edit mode - toon formulier
+                tx_data = get_transaction_by_id(tx_id)
+
+                with st.container():
+                    st.info("✏️ Bezig met bewerken...")
+
+                    with st.form(f"edit_form_{tx_id}"):
+                        edit_col1, edit_col2, edit_col3 = st.columns(3)
+
+                        with edit_col1:
+                            edit_date = st.date_input("Datum", value=pd.to_datetime(tx_data['date']), key=f"date_{tx_id}", format="DD/MM/YYYY")
+                            edit_type = st.selectbox("Type", ["BUY", "SELL"],
+                                                    index=0 if tx_data['transaction_type'] == 'BUY' else 1,
+                                                    key=f"type_{tx_id}")
+
+                        with edit_col2:
+                            edit_quantity = st.number_input("Aantal", min_value=1, step=1,
+                                                           value=int(tx_data['quantity']),
+                                                           key=f"qty_{tx_id}")
+                            edit_price = st.number_input("Prijs/stuk", min_value=0.0, step=0.01, format="%.2f",
+                                                        value=float(tx_data['price_per_share']),
+                                                        key=f"price_{tx_id}")
+
+                            # Valuta selectie
+                            currency_options = ["EUR", "USD", "GBP"]
+                            current_currency = tx_data.get('currency', 'EUR')
+                            if current_currency in currency_options:
+                                currency_idx = currency_options.index(current_currency)
+                            else:
+                                currency_idx = 0
+                            edit_currency = st.selectbox("Valuta", currency_options,
+                                                        index=currency_idx,
+                                                        key=f"currency_{tx_id}")
+
+                        with edit_col3:
+                            edit_fees = st.number_input("Kosten (€)", min_value=0.0, step=0.01, format="%.2f",
+                                                       value=float(tx_data['fees']),
+                                                       key=f"fees_{tx_id}",
+                                                       help="Broker kosten in EUR")
+                            edit_taxes = st.number_input("Taxen (€)", min_value=0.0, step=0.01, format="%.2f",
+                                                        value=float(tx_data.get('taxes', 0)),
+                                                        key=f"taxes_{tx_id}",
+                                                        help="Beurstaks in EUR")
+
+                            # Wisselkoers veld (altijd tonen, maar hint geven)
+                            edit_exchange_rate = st.number_input(
+                                "Wisselkoers (EUR/USD)",
+                                min_value=0.0,
+                                step=0.0001,
+                                format="%.4f",
+                                value=float(tx_data.get('exchange_rate', 1.0)),
+                                key=f"exrate_{tx_id}",
+                                help="Wisselkoers op moment van aankoop (bijv. 0.93 voor USD→EUR). Laat op 1.0 voor EUR."
+                            )
+
+                            # Broker dropdown - ALLEEN geconfigureerde brokers
+                            available_brokers = get_available_brokers()
+                            if available_brokers:
+                                # Zoek huidige broker in de lijst
+                                if tx_data['broker'] in available_brokers:
+                                    current_broker_idx = available_brokers.index(tx_data['broker'])
+                                else:
+                                    # Broker bestaat niet meer in settings, gebruik eerste
+                                    current_broker_idx = 0
+                                    st.warning(f"⚠️ Broker '{tx_data['broker']}' niet gevonden in Broker Settings")
+
+                                edit_broker = st.selectbox("Broker", available_brokers,
+                                                          index=current_broker_idx,
+                                                          key=f"broker_{tx_id}")
+                            else:
+                                st.error("⚠️ Geen brokers geconfigureerd. Ga naar **Broker Settings**")
+                                edit_broker = tx_data['broker']  # Behoud huidige waarde
+
+                        edit_notes = st.text_area("Notities", value=tx_data['notes'] if pd.notna(tx_data['notes']) else "",
+                                                 height=60, key=f"notes_{tx_id}")
+
+                        col_save, col_cancel, col_delete = st.columns([1, 1, 1])
+
+                        with col_save:
+                            if st.form_submit_button("💾 Opslaan", type="primary", use_container_width=True):
+                                update_transaction(
+                                    tx_id,
+                                    edit_date,
+                                    edit_broker,
+                                    edit_type,
+                                    edit_quantity,
+                                    edit_price,
+                                    edit_currency,
+                                    edit_fees,
+                                    edit_taxes,
+                                    edit_exchange_rate,
+                                    edit_notes
+                                )
+                                st.session_state.editing_transaction = None
+                                st.success("✓ Transactie bijgewerkt!")
+                                st.rerun()
+
+                        with col_cancel:
+                            if st.form_submit_button("✗ Annuleer", use_container_width=True):
+                                st.session_state.editing_transaction = None
+                                st.rerun()
+
+                        with col_delete:
+                            if st.form_submit_button("🗑️ Verwijder", type="secondary", use_container_width=True):
+                                delete_transaction(tx_id)
+                                st.session_state.editing_transaction = None
+                                st.success("Transactie verwijderd!")
+                                st.rerun()
+
+                st.divider()
+
     else:
         st.info("Nog geen transacties gevonden")
 
@@ -517,9 +765,36 @@ with tab2:
         tax_calc = TaxCalculator()
         broker = get_broker_for_ticker(ticker)
 
-        # Maak tabel
-        div_table_data = []
+        # Initialize edit state
+        if 'editing_dividend' not in st.session_state:
+            st.session_state.editing_dividend = None
+
+        # Header rij
+        header_col1, header_col2, header_col3, header_col4, header_col5, header_col6, header_col7, header_col8 = st.columns([1.5, 0.8, 1, 1, 1, 0.8, 0.8, 0.5])
+        with header_col1:
+            st.markdown("**Datum**")
+        with header_col2:
+            st.markdown("**Currency**")
+        with header_col3:
+            st.markdown("**Bruto**")
+        with header_col4:
+            st.markdown("**Tax**")
+        with header_col5:
+            st.markdown("**Netto**")
+        with header_col6:
+            st.markdown("**Tax ✓**")
+        with header_col7:
+            st.markdown("**Ontv ✓**")
+        with header_col8:
+            st.markdown("")
+
+        st.divider()
+
+        # Toon elke dividend als een rij met edit knop
         for _, row in dividends_df.iterrows():
+            div_id = row['id']
+            is_editing = st.session_state.editing_dividend == div_id
+
             bruto = row['bruto_amount']
             currency = row.get('currency', 'EUR')
             tax_paid = row.get('tax_paid', 1)
@@ -529,69 +804,106 @@ with tab2:
             if not received:
                 tax_paid = 0
 
-            # Check voor handmatige tax waarden
-            withheld = row.get('withheld_amount', 0) or 0
-            additional_tax = row.get('additional_tax_due', 0) or 0
-            net_received_manual = row.get('net_received')
-
-            # Bereken tax intelligent
+            # Bereken tax voor display
             if tax_paid:
-                if withheld > 0 or additional_tax > 0 or net_received_manual:
-                    tax = withheld + additional_tax
-                    netto = net_received_manual if net_received_manual else (bruto - tax)
-                    tax_label = 'Tax (Manual)'
-                else:
-                    tax_result = tax_calc.calculate_tax(bruto, ticker, broker)
-                    tax = tax_result['total_tax']
-                    netto = tax_result['net_amount']
-                    stock_info_tax = tax_calc.get_stock_info(ticker)
-                    if stock_info_tax and stock_info_tax['asset_type'] == 'REIT':
-                        tax_label = 'Tax (REIT)'
-                    elif stock_info_tax and stock_info_tax['country'] == 'Verenigde Staten':
-                        tax_label = 'Tax (US+BE)'
-                    else:
-                        tax_label = 'Tax'
+                tax_result = tax_calc.calculate_tax(bruto, ticker, broker)
+                tax = tax_result['total_tax']
+                netto = tax_result['net_amount']
             else:
                 tax = 0
                 netto = bruto
-                tax_label = 'Tax'
 
-            div_table_data.append({
-                'ID': row['id'],
-                'Ex-Dividend Datum': row['ex_date'],
-                'Currency': currency,
-                'Bruto': format_currency(bruto, currency),
-                tax_label: format_currency(tax, currency) if tax_paid else '-',
-                'Netto': format_currency(netto, currency),
-                'Tax betaald': "✅" if tax_paid else "❌",
-                'Ontvangen': "✅" if received else "❌",
-                'Notities': row['notes'] if row['notes'] else '-'
-            })
+            if not is_editing:
+                # View mode
+                col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([1.5, 0.8, 1, 1, 1, 0.8, 0.8, 0.5])
 
-        div_display_df = pd.DataFrame(div_table_data)
+                with col1:
+                    st.write(f"**{row['ex_date']}**")
+                with col2:
+                    st.write(currency)
+                with col3:
+                    st.write(format_currency(bruto, currency))
+                with col4:
+                    st.write(format_currency(tax, currency) if tax_paid else "-")
+                with col5:
+                    st.write(format_currency(netto, currency))
+                with col6:
+                    st.write("✅" if tax_paid else "❌")
+                with col7:
+                    st.write("✅" if received else "❌")
+                with col8:
+                    if st.button("✏️", key=f"edit_div_{div_id}", help="Bewerk dividend"):
+                        st.session_state.editing_dividend = div_id
+                        st.rerun()
 
-        # Bepaal welke tax kolom te tonen
-        tax_column = next((col for col in div_display_df.columns if 'Tax' in col and col not in ['Tax betaald']), 'Tax')
+                st.divider()
 
-        # Toon tabel (zonder ID kolom in display)
-        st.dataframe(
-            div_display_df[['Ex-Dividend Datum', 'Currency', 'Bruto', tax_column, 'Netto', 'Tax betaald', 'Ontvangen', 'Notities']],
-            use_container_width=True,
-            hide_index=True
-        )
+            else:
+                # Edit mode
+                with st.container():
+                    st.info("✏️ Bezig met bewerken...")
 
-        # Delete functionaliteit
-        with st.expander("🗑️ Dividend verwijderen"):
-            delete_id = st.selectbox(
-                "Selecteer dividend om te verwijderen",
-                options=div_display_df['ID'].tolist(),
-                format_func=lambda x: f"{div_display_df[div_display_df['ID']==x]['Ex-Dividend Datum'].values[0]} - {div_display_df[div_display_df['ID']==x]['Bruto'].values[0]}"
-            )
+                    with st.form(f"edit_div_form_{div_id}"):
+                        div_col1, div_col2 = st.columns(2)
 
-            if st.button("🗑️ Verwijder geselecteerd dividend", type="secondary"):
-                delete_dividend(delete_id)
-                st.success("Dividend verwijderd!")
-                st.rerun()
+                        with div_col1:
+                            edit_div_date = st.date_input("Ex-Dividend Datum",
+                                                          value=pd.to_datetime(row['ex_date']),
+                                                          key=f"div_date_{div_id}",
+                                                          format="DD/MM/YYYY")
+                            edit_div_amount = st.number_input("Bruto bedrag", min_value=0.0, step=0.01,
+                                                             format="%.2f", value=float(bruto),
+                                                             key=f"div_amount_{div_id}")
+                            edit_div_currency = st.selectbox("Currency",
+                                                            options=["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"],
+                                                            index=["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"].index(currency) if currency in ["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"] else 0,
+                                                            key=f"div_curr_{div_id}")
+
+                        with div_col2:
+                            edit_div_notes = st.text_area("Notities",
+                                                         value=row['notes'] if pd.notna(row['notes']) else "",
+                                                         height=40,
+                                                         key=f"div_notes_{div_id}")
+                            edit_div_received = st.checkbox("✅ Ontvangen",
+                                                           value=bool(received),
+                                                           key=f"div_recv_{div_id}")
+                            edit_div_tax_paid = st.checkbox("💰 Tax betaald",
+                                                           value=bool(tax_paid),
+                                                           key=f"div_tax_{div_id}")
+
+                        st.info("ℹ️ Tax kan alleen betaald zijn als dividend ontvangen is")
+
+                        col_save, col_cancel, col_delete = st.columns([1, 1, 1])
+
+                        with col_save:
+                            if st.form_submit_button("💾 Opslaan", type="primary", use_container_width=True):
+                                final_tax_paid = edit_div_tax_paid and edit_div_received
+                                update_dividend(
+                                    div_id,
+                                    edit_div_date,
+                                    edit_div_amount,
+                                    edit_div_currency,
+                                    final_tax_paid,
+                                    edit_div_received,
+                                    edit_div_notes
+                                )
+                                st.session_state.editing_dividend = None
+                                st.success("✓ Dividend bijgewerkt!")
+                                st.rerun()
+
+                        with col_cancel:
+                            if st.form_submit_button("✗ Annuleer", use_container_width=True):
+                                st.session_state.editing_dividend = None
+                                st.rerun()
+
+                        with col_delete:
+                            if st.form_submit_button("🗑️ Verwijder", type="secondary", use_container_width=True):
+                                delete_dividend(div_id)
+                                st.session_state.editing_dividend = None
+                                st.success("Dividend verwijderd!")
+                                st.rerun()
+
+                st.divider()
 
         # Toon totalen
         st.divider()
@@ -617,7 +929,7 @@ with tab2:
         col1, col2 = st.columns(2)
 
         with col1:
-            div_date = st.date_input("Ex-Dividend Datum")
+            div_date = st.date_input("Ex-Dividend Datum", format="DD/MM/YYYY")
             div_amount = st.number_input(
                 "Bruto bedrag",
                 min_value=0.0,
@@ -674,20 +986,15 @@ with tab3:
         col1, col2 = st.columns(2)
 
         with col1:
-            tx_date = st.date_input("Datum")
+            tx_date = st.date_input("Datum", format="DD/MM/YYYY")
 
-            # Broker dropdown
+            # Broker dropdown - ALLEEN geconfigureerde brokers
             available_brokers = get_available_brokers()
             if available_brokers:
-                broker_options = available_brokers + ["➕ Andere (nieuwe broker toevoegen)"]
-                broker_selection = st.selectbox("Broker", broker_options)
-
-                if broker_selection == "➕ Andere (nieuwe broker toevoegen)":
-                    tx_broker = st.text_input("Nieuwe broker naam")
-                else:
-                    tx_broker = broker_selection
+                tx_broker = st.selectbox("Broker", available_brokers)
             else:
-                tx_broker = st.text_input("Broker")
+                st.error("⚠️ Geen brokers geconfigureerd. Ga naar **Broker Settings**")
+                tx_broker = None
 
             tx_type = st.selectbox("Type", ["BUY", "SELL"])
             tx_quantity = st.number_input("Aantal aandelen", min_value=1, step=1)
@@ -705,11 +1012,33 @@ with tab3:
                 index=0
             )
             tx_fees = st.number_input(
-                "Kosten (broker + taksen)",
+                "Kosten (€)",
                 min_value=0.0,
                 step=0.01,
-                format="%.2f"
+                format="%.2f",
+                help="Broker kosten in EUR"
             )
+            tx_taxes = st.number_input(
+                "Taxen (€)",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Beurstaks in EUR"
+            )
+
+            # Wisselkoers veld (alleen tonen als niet EUR)
+            if tx_currency != 'EUR':
+                tx_exchange_rate = st.number_input(
+                    "Wisselkoers (EUR/USD)",
+                    min_value=0.0,
+                    step=0.0001,
+                    format="%.4f",
+                    value=1.0,
+                    help="Wisselkoers op moment van aankoop (bijv. 0.93 voor USD→EUR)"
+                )
+            else:
+                tx_exchange_rate = 1.0
+
             tx_notes = st.text_area("Notities (optioneel)", height=100)
 
         tx_submitted = st.form_submit_button("💾 Transactie opslaan", type="primary")
@@ -729,7 +1058,8 @@ with tab3:
                     tx_price,
                     tx_currency,
                     tx_fees,
-                    1.0,
+                    tx_taxes,
+                    tx_exchange_rate,
                     tx_notes
                 )
                 st.success(f"✓ {tx_type} transactie opgeslagen!")
