@@ -186,9 +186,62 @@ def get_broker_for_ticker(ticker):
     return result[0] if result else None
 
 
-def calculate_total_dividends(ticker):
+def get_ownership_period(ticker):
+    """Bepaalt de periode waarin je het aandeel in bezit had/hebt."""
+    conn = get_connection()
+
+    query = """
+    SELECT
+        date,
+        transaction_type,
+        quantity,
+        SUM(CASE WHEN transaction_type = 'BUY' THEN quantity ELSE -quantity END)
+            OVER (ORDER BY date) as running_total
+    FROM transactions
+    WHERE ticker = ?
+    ORDER BY date
+    """
+
+    df = pd.read_sql_query(query, conn, params=(ticker,))
+    conn.close()
+
+    if df.empty:
+        return None, None
+
+    # Eerste aankoop
+    first_purchase = df.iloc[0]['date']
+
+    # Check of er een verkoop is waarbij alle aandelen zijn verkocht
+    last_sale_date = None
+    for idx, row in df.iterrows():
+        if row['running_total'] == 0:
+            last_sale_date = row['date']
+
+    return first_purchase, last_sale_date
+
+
+def calculate_total_dividends(ticker, filter_ownership=True):
     """Berekent totaal ontvangen dividend (bruto en netto) voor een ticker - ALLEEN ontvangen dividenden."""
     df = get_manual_dividends(ticker)
+
+    if not df.empty and filter_ownership:
+        first_purchase, last_sale = get_ownership_period(ticker)
+
+        if first_purchase:
+            # Filter dividenden die binnen de ownership periode vallen
+            df['ex_date'] = pd.to_datetime(df['ex_date'])
+            first_purchase_dt = pd.to_datetime(first_purchase)
+
+            # Filter: ex_date >= eerste aankoop
+            df = df[df['ex_date'] >= first_purchase_dt]
+
+            # Als er een volledige verkoop is geweest, filter ook tot die datum
+            if last_sale:
+                last_sale_dt = pd.to_datetime(last_sale)
+                df = df[df['ex_date'] <= last_sale_dt]
+
+            # Convert ex_date terug naar string voor display
+            df['ex_date'] = df['ex_date'].dt.strftime('%Y-%m-%d')
 
     if df.empty:
         return {
@@ -218,7 +271,14 @@ def calculate_total_dividends(ticker):
     total_netto = 0
 
     for _, row in received_df.iterrows():
-        if row.get('tax_paid', 1):
+        tax_paid = row.get('tax_paid', 1)
+        received = row.get('received', 0)
+
+        # BELANGRIJKE REGEL: Tax kan alleen betaald zijn als dividend ontvangen is
+        if not received:
+            tax_paid = 0
+
+        if tax_paid:
             # Check voor handmatige tax waarden
             withheld = row.get('withheld_amount', 0) or 0
             additional_tax = row.get('additional_tax_due', 0) or 0
@@ -251,10 +311,11 @@ def get_portfolio_holdings():
     """
     Haalt alle holdings op gegroepeerd per aandeel.
     Berekent totaal aantal aandelen, gemiddelde aankoopprijs per aandeel.
+    Inclusief broker informatie (meest recente broker per ticker).
     """
     conn = get_connection()
 
-    # Haal alle transacties op
+    # Haal alle transacties op met broker info
     query = """
     SELECT
         ticker,
@@ -265,7 +326,8 @@ def get_portfolio_holdings():
         SUM(CASE WHEN transaction_type = 'BUY' THEN quantity * price_per_share ELSE 0 END) as total_invested,
         SUM(CASE WHEN transaction_type = 'BUY' THEN fees ELSE 0 END) as total_fees,
         currency,
-        MIN(date) as first_purchase_date
+        MIN(date) as first_purchase_date,
+        (SELECT broker FROM transactions t2 WHERE t2.ticker = transactions.ticker ORDER BY date DESC LIMIT 1) as broker
     FROM transactions
     GROUP BY ticker, isin, name, currency
     HAVING total_quantity > 0
@@ -460,6 +522,12 @@ if holdings.empty:
     st.info("Je portfolio is nog leeg. Voeg eerst transacties toe op de hoofdpagina.")
     st.stop()
 
+# Check if we need to show detail view
+if 'view_detail_ticker' in st.query_params:
+    # Redirect to detail view
+    st.session_state['selected_ticker'] = st.query_params['view_detail_ticker']
+    st.switch_page("pages/1_Portfolio_Detail.py")
+
 # Toon laatste update tijd en refresh knop
 col1, col2, col3 = st.columns([2, 1, 1])
 
@@ -493,13 +561,25 @@ with col3:
         st.session_state['refresh_prices'] = True
         st.rerun()
 
-# Initialize session state voor geselecteerd aandeel en refresh flag
-if 'selected_ticker' not in st.session_state:
-    st.session_state.selected_ticker = None
-
 refresh_prices = st.session_state.get('refresh_prices', False)
 if refresh_prices:
     st.session_state['refresh_prices'] = False  # Reset flag
+
+# Filters
+st.divider()
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    # Broker filter
+    all_brokers = holdings['broker'].unique().tolist()
+    broker_filter = st.multiselect("Filter op Broker", options=all_brokers, default=all_brokers)
+
+with col2:
+    # Naam filter
+    name_filter = st.text_input("Zoek op naam/ticker", "")
+
+with col3:
+    st.write("")
 
 # Toon portfolio overzicht
 st.subheader("Jouw Holdings")
@@ -512,6 +592,13 @@ with st.spinner(spinner_text):
     for idx, row in holdings.iterrows():
         ticker = row['ticker']
         isin = row['isin']
+        broker = row['broker']
+
+        # Apply filters
+        if broker not in broker_filter:
+            continue
+        if name_filter and name_filter.lower() not in row['name'].lower() and name_filter.lower() not in ticker.lower():
+            continue
 
         # Haal huidige prijs op (met ISIN voor juiste ticker lookup)
         # refresh=True als de refresh knop is ingedrukt
@@ -534,6 +621,7 @@ with st.spinner(spinner_text):
             portfolio_data.append({
                 'Aandeel': row['name'],
                 'Ticker': ticker,
+                'Broker': broker,
                 'ISIN': row['isin'],
                 'Aantal': int(row['total_quantity']),
                 'Avg Aankoopprijs': f"€{row['avg_purchase_price']:.2f}",
@@ -541,7 +629,8 @@ with st.spinner(spinner_text):
                 'Totaal Geinvesteerd': f"€{perf['total_invested']:.2f}",
                 'Huidige Waarde': f"€{perf['current_value']:.2f}",
                 'Dividend (netto)': f"€{div_info['total_netto']:.2f}",
-                'Winst/Verlies': f"€{perf['total_gain_loss']:.2f}",
+                'W/V (excl. div)': f"€{perf['total_gain_loss_excl_div']:.2f}",
+                'W/V (incl. div)': f"€{perf['total_gain_loss']:.2f}",
                 'Performance': f"{perf['gain_loss_percent']:+.2f}%",
                 '_current_price': current_price,
                 '_perf': perf,
@@ -555,6 +644,7 @@ with st.spinner(spinner_text):
             portfolio_data.append({
                 'Aandeel': row['name'],
                 'Ticker': ticker,
+                'Broker': broker,
                 'ISIN': row['isin'],
                 'Aantal': int(row['total_quantity']),
                 'Avg Aankoopprijs': f"€{row['avg_purchase_price']:.2f}",
@@ -562,7 +652,8 @@ with st.spinner(spinner_text):
                 'Totaal Geinvesteerd': f"€{row['total_invested_with_fees']:.2f}",
                 'Huidige Waarde': "N/A",
                 'Dividend (netto)': f"€{div_info['total_netto']:.2f}",
-                'Winst/Verlies': "N/A",
+                'W/V (excl. div)': "N/A",
+                'W/V (incl. div)': "N/A",
                 'Performance': "N/A",
                 '_error': price_info.get('error', 'Onbekende fout') if price_info else 'API error'
             })
@@ -570,288 +661,63 @@ with st.spinner(spinner_text):
 # Maak DataFrame voor display
 portfolio_df = pd.DataFrame(portfolio_data)
 
-# Toon portfolio tabel (zonder hidden columns)
-display_columns = ['Aandeel', 'Ticker', 'Aantal', 'Avg Aankoopprijs', 'Huidige Prijs',
-                   'Totaal Geinvesteerd', 'Huidige Waarde', 'Dividend (netto)', 'Winst/Verlies', 'Performance']
+if portfolio_df.empty:
+    st.info("Geen aandelen gevonden met de huidige filters.")
+else:
+    # Toon portfolio tabel (zonder hidden columns)
+    display_columns = ['Aandeel', 'Ticker', 'Broker', 'Aantal', 'Avg Aankoopprijs', 'Huidige Prijs',
+                       'Totaal Geinvesteerd', 'Huidige Waarde', 'Dividend (netto)', 'W/V (excl. div)', 'W/V (incl. div)', 'Performance']
 
-st.dataframe(
-    portfolio_df[display_columns],
-    use_container_width=True,
-    hide_index=True
-)
-
-# Bereken totalen
-total_invested = sum([row['_perf']['total_invested'] for row in portfolio_data if '_perf' in row])
-total_current = sum([row['_perf']['current_value'] for row in portfolio_data if '_perf' in row])
-total_gain_loss = total_current - total_invested
-total_gain_loss_percent = (total_gain_loss / total_invested * 100) if total_invested > 0 else 0
-
-# Toon totalen
-st.divider()
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric("Totaal Geinvesteerd", f"€{total_invested:,.2f}")
-
-with col2:
-    st.metric("Huidige Waarde", f"€{total_current:,.2f}")
-
-with col3:
-    st.metric(
-        "Totale Winst/Verlies",
-        f"€{total_gain_loss:,.2f}",
-        delta=f"{total_gain_loss_percent:+.2f}%"
+    # Gebruik st.dataframe met on_select callback
+    event = st.dataframe(
+        portfolio_df[display_columns],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row"
     )
 
-with col4:
-    st.metric(
-        "Performance",
-        f"{total_gain_loss_percent:+.2f}%",
-        delta=None
-    )
+    # Handle row selection
+    if len(event.selection.rows) > 0:
+        selected_idx = event.selection.rows[0]
+        selected_ticker = portfolio_df.iloc[selected_idx]['Ticker']
+        st.query_params['view_detail_ticker'] = selected_ticker
+        st.rerun()
 
-# Klikbare aandeel details
-st.divider()
-st.subheader("Aandeel Details")
+# Bereken totalen alleen als er data is
+if portfolio_data:
+    total_invested = sum([row['_perf']['total_invested'] for row in portfolio_data if '_perf' in row])
+    total_current = sum([row['_perf']['current_value'] for row in portfolio_data if '_perf' in row])
+    total_dividends = sum([row['_perf']['total_dividends_netto'] for row in portfolio_data if '_perf' in row])
+    total_gain_loss_excl = total_current - total_invested
+    total_gain_loss_incl = total_gain_loss_excl + total_dividends
+    total_gain_loss_percent = (total_gain_loss_incl / total_invested * 100) if total_invested > 0 else 0
 
-# Selecteer aandeel via selectbox
-selected_ticker = st.selectbox(
-    "Selecteer een aandeel voor gedetailleerde informatie:",
-    options=portfolio_df['Ticker'].tolist(),
-    format_func=lambda x: f"{portfolio_df[portfolio_df['Ticker']==x]['Aandeel'].values[0]} ({x})"
-)
-
-if selected_ticker:
-    # Zoek geselecteerde rij
-    selected_data = portfolio_df[portfolio_df['Ticker'] == selected_ticker].iloc[0]
-
-    st.write(f"### {selected_data['Aandeel']} ({selected_ticker})")
-
-    # Toon details in kolommen
-    col1, col2, col3 = st.columns(3)
+    # Toon totalen
+    st.divider()
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        st.write("**Basis Informatie**")
-        st.write(f"- ISIN: `{selected_data['ISIN']}`")
-        st.write(f"- Aantal aandelen: **{selected_data['Aantal']}**")
-        st.write(f"- Avg Aankoopprijs: **{selected_data['Avg Aankoopprijs']}**")
+        st.metric("Totaal Geinvesteerd", f"€{total_invested:,.2f}")
 
     with col2:
-        st.write("**Huidige Status**")
-        st.write(f"- Huidige prijs: **{selected_data['Huidige Prijs']}**")
-        st.write(f"- Totaal geinvesteerd: **{selected_data['Totaal Geinvesteerd']}**")
-        st.write(f"- Huidige waarde: **{selected_data['Huidige Waarde']}**")
+        st.metric("Huidige Waarde", f"€{total_current:,.2f}")
 
     with col3:
-        st.write("**Performance**")
-        st.write(f"- Winst/Verlies: **{selected_data['Winst/Verlies']}**")
+        st.metric("Totaal Dividend", f"€{total_dividends:,.2f}")
 
-        # Kleurcode voor performance
-        if '_perf' in selected_data:
-            perf_value = selected_data['_perf']['gain_loss_percent']
-            color = "🟢" if perf_value >= 0 else "🔴"
-            st.write(f"- Performance: **{color} {selected_data['Performance']}**")
-        else:
-            st.write(f"- Performance: **{selected_data['Performance']}**")
-
-    # Dividend sectie
-    st.divider()
-    st.write("### 💰 Dividend Beheer")
-
-    # Formulier om dividend toe te voegen
-    with st.expander("➕ Nieuw dividend toevoegen", expanded=False):
-        with st.form(f"dividend_form_{selected_ticker}"):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                div_date = st.date_input("Ex-Dividend Datum", key=f"div_date_{selected_ticker}")
-                div_amount = st.number_input(
-                    "Bruto bedrag",
-                    min_value=0.0,
-                    step=0.01,
-                    format="%.2f",
-                    help="Voer het totale bruto dividend in (voor al je aandelen)",
-                    key=f"div_amount_{selected_ticker}"
-                )
-                div_currency = st.selectbox(
-                    "Currency",
-                    options=["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"],
-                    index=0,
-                    key=f"div_currency_{selected_ticker}"
-                )
-
-            with col2:
-                div_notes = st.text_area(
-                    "Notities (optioneel)",
-                    height=40,
-                    key=f"div_notes_{selected_ticker}"
-                )
-                div_received = st.checkbox(
-                    "✅ Ontvangen",
-                    value=False,
-                    help="Vink aan als je dit dividend al ontvangen hebt",
-                    key=f"div_received_{selected_ticker}"
-                )
-                div_tax_paid = st.checkbox(
-                    "💰 Tax betaald",
-                    value=False,
-                    help="Vink aan als je belasting betaald hebt op dit dividend (⚠️ Kan alleen als dividend ontvangen is). Tax bedrag wordt automatisch berekend op basis van asset type en broker.",
-                    key=f"div_tax_{selected_ticker}"
-                )
-
-            st.info("ℹ️ Tax kan alleen betaald zijn als dividend ontvangen is")
-
-            div_submitted = st.form_submit_button("💾 Dividend opslaan")
-
-            if div_submitted and div_amount > 0:
-                # Logica: tax_paid kan alleen true zijn als received ook true is
-                final_tax_paid = div_tax_paid and div_received
-
-                if div_tax_paid and not div_received:
-                    st.warning("⚠️ Tax betaald is uitgezet omdat dividend nog niet ontvangen is")
-
-                add_dividend(
-                    selected_ticker,
-                    selected_data['ISIN'],
-                    div_date,
-                    div_amount,
-                    div_notes,
-                    div_currency,
-                    final_tax_paid,
-                    div_received
-                )
-                st.success(f"✓ Dividend van {format_currency(div_amount, div_currency)} toegevoegd!")
-                st.rerun()
-
-    # Haal bestaande dividenden op
-    dividends_df = get_manual_dividends(selected_ticker)
-
-    if not dividends_df.empty:
-        st.write("#### Ontvangen Dividenden")
-
-        # Bereken totalen met intelligente tax calculator
-        div_info = calculate_total_dividends(selected_ticker)
-        tax_calc = TaxCalculator()
-        broker = get_broker_for_ticker(selected_ticker)
-
-        # Maak tabel met actie knoppen
-        div_table_data = []
-        for _, row in dividends_df.iterrows():
-            bruto = row['bruto_amount']
-            currency = row.get('currency', 'EUR')
-            tax_paid = row.get('tax_paid', 1)
-            received = row.get('received', 0)
-
-            # Check voor handmatige tax waarden
-            withheld = row.get('withheld_amount', 0) or 0
-            additional_tax = row.get('additional_tax_due', 0) or 0
-            net_received_manual = row.get('net_received')
-
-            # Bereken tax intelligent
-            if tax_paid:
-                if withheld > 0 or additional_tax > 0 or net_received_manual:
-                    # Gebruik handmatige waarden
-                    tax = withheld + additional_tax
-                    netto = net_received_manual if net_received_manual else (bruto - tax)
-                    tax_label = 'Tax (Manual)'
-                else:
-                    # Gebruik automatische calculator
-                    tax_result = tax_calc.calculate_tax(bruto, selected_ticker, broker)
-                    tax = tax_result['total_tax']
-                    netto = tax_result['net_amount']
-                    # Bepaal tax label
-                    stock_info = tax_calc.get_stock_info(selected_ticker)
-                    if stock_info and stock_info['asset_type'] == 'REIT':
-                        tax_label = 'Tax (REIT)'
-                    elif stock_info and stock_info['country'] == 'Verenigde Staten':
-                        tax_label = 'Tax (US+BE)'
-                    else:
-                        tax_label = 'Tax'
-            else:
-                tax = 0
-                netto = bruto
-                tax_label = 'Tax'
-
-            div_table_data.append({
-                'ID': row['id'],
-                'Ex-Dividend Datum': row['ex_date'],
-                'Currency': currency,
-                'Bruto': format_currency(bruto, currency),
-                tax_label: format_currency(tax, currency) if tax_paid else '-',
-                'Netto': format_currency(netto, currency),
-                'Tax betaald': "✅" if tax_paid else "❌",
-                'Ontvangen': "✅" if received else "❌",
-                'Notities': row['notes'] if row['notes'] else '-'
-            })
-
-        div_display_df = pd.DataFrame(div_table_data)
-
-        # Bepaal welke tax kolom te tonen (eerste niet-standaard kolom of "Tax")
-        tax_column = next((col for col in div_display_df.columns if 'Tax' in col and col not in ['Tax betaald']), 'Tax')
-
-        # Toon tabel (zonder ID kolom in display)
-        st.dataframe(
-            div_display_df[['Ex-Dividend Datum', 'Currency', 'Bruto', tax_column, 'Netto', 'Tax betaald', 'Ontvangen', 'Notities']],
-            use_container_width=True,
-            hide_index=True
+    with col4:
+        st.metric(
+            "W/V (excl. div)",
+            f"€{total_gain_loss_excl:,.2f}",
+            delta=f"{(total_gain_loss_excl/total_invested*100):+.2f}%" if total_invested > 0 else None
         )
 
-        # Delete functionaliteit
-        with st.expander("🗑️ Dividend verwijderen"):
-            delete_id = st.selectbox(
-                "Selecteer dividend om te verwijderen",
-                options=div_display_df['ID'].tolist(),
-                format_func=lambda x: f"{div_display_df[div_display_df['ID']==x]['Ex-Dividend Datum'].values[0]} - {div_display_df[div_display_df['ID']==x]['Bruto'].values[0]}"
-            )
+    with col5:
+        st.metric(
+            "W/V (incl. div)",
+            f"€{total_gain_loss_incl:,.2f}",
+            delta=f"{total_gain_loss_percent:+.2f}%"
+        )
 
-            if st.button("🗑️ Verwijder geselecteerd dividend", type="secondary"):
-                delete_dividend(delete_id)
-                st.success("Dividend verwijderd!")
-                st.rerun()
-
-        # Toon totalen - ALLEEN ontvangen dividenden
-        st.divider()
-        st.write(f"### 📊 Ontvangen Dividenden ({div_info['received_count']}/{div_info['count']})")
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.metric("Totaal Bruto (ontvangen)", f"€{div_info['total_bruto']:.2f}")
-
-        with col2:
-            st.metric("Totaal Tax Betaald", f"€{div_info['total_tax']:.2f}", delta=None, delta_color="off")
-
-        with col3:
-            st.metric("Totaal Netto (ontvangen)", f"€{div_info['total_netto']:.2f}", delta=f"+{div_info['total_netto']:.2f}")
-
-        # Toon impact op totale performance
-        if '_perf' in selected_data and div_info['total_netto'] > 0:
-            st.info(f"💡 Je totale winst/verlies (inclusief €{div_info['total_netto']:.2f} netto dividend) is: **€{selected_data['_perf']['total_gain_loss']:.2f}** ({selected_data['_perf']['gain_loss_percent']:+.2f}%)")
-    else:
-        st.info("Nog geen dividenden toegevoegd. Gebruik het formulier hierboven om dividenden toe te voegen.")
-
-    # Haal gedetailleerde transactie geschiedenis op
-    st.divider()
-    st.write("### 📜 Transactie Geschiedenis")
-
-    conn = get_connection()
-    tx_query = f"""
-    SELECT
-        date as Datum,
-        transaction_type as Type,
-        quantity as Aantal,
-        price_per_share as 'Prijs/stuk',
-        fees as Kosten,
-        (quantity * price_per_share + fees) as Totaal
-    FROM transactions
-    WHERE ticker = '{selected_ticker}'
-    ORDER BY date DESC
-    """
-
-    tx_df = pd.read_sql_query(tx_query, conn)
-    conn.close()
-
-    st.dataframe(tx_df, use_container_width=True, hide_index=True)
-
-    # Refresh button
-    if st.button("🔄 Ververs prijzen", type="primary"):
-        st.rerun()
+    st.info("💡 Klik op een rij in de tabel om de details van een aandeel te bekijken")
