@@ -22,18 +22,11 @@ def get_connection():
             country TEXT NOT NULL,
             has_w8ben INTEGER DEFAULT 0,
             w8ben_expiry_date TEXT,
-            historical_costs REAL DEFAULT 0,
             notes TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
-
-    # Voeg historical_costs kolom toe als die nog niet bestaat
-    try:
-        conn.execute("ALTER TABLE broker_settings ADD COLUMN historical_costs REAL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # Kolom bestaat al
 
     # Maak stock_info tabel voor asset type tracking
     conn.execute("""
@@ -134,7 +127,7 @@ def get_all_brokers():
     """Haal alle broker configuraties op."""
     conn = get_connection()
     df = pd.read_sql_query("""
-        SELECT id, broker_name, country, has_w8ben, w8ben_expiry_date, historical_costs, notes, updated_at
+        SELECT id, broker_name, country, has_w8ben, w8ben_expiry_date, notes, updated_at
         FROM broker_settings
         ORDER BY broker_name
     """, conn)
@@ -142,7 +135,7 @@ def get_all_brokers():
     return df
 
 
-def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, historical_costs=0, notes=""):
+def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, notes=""):
     """Voeg een nieuwe broker toe."""
     conn = get_connection()
     cursor = conn.cursor()
@@ -150,9 +143,9 @@ def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, historic
 
     try:
         cursor.execute("""
-            INSERT INTO broker_settings (broker_name, country, has_w8ben, w8ben_expiry_date, historical_costs, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, float(historical_costs), notes, now, now))
+            INSERT INTO broker_settings (broker_name, country, has_w8ben, w8ben_expiry_date, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, notes, now, now))
         conn.commit()
         conn.close()
         return True
@@ -161,7 +154,7 @@ def add_broker(broker_name, country, has_w8ben, w8ben_expiry_date=None, historic
         return False
 
 
-def update_broker(broker_id, broker_name, country, has_w8ben, w8ben_expiry_date=None, historical_costs=0, notes=""):
+def update_broker(broker_id, broker_name, country, has_w8ben, w8ben_expiry_date=None, notes=""):
     """Update een bestaande broker."""
     conn = get_connection()
     cursor = conn.cursor()
@@ -169,9 +162,9 @@ def update_broker(broker_id, broker_name, country, has_w8ben, w8ben_expiry_date=
 
     cursor.execute("""
         UPDATE broker_settings
-        SET broker_name = ?, country = ?, has_w8ben = ?, w8ben_expiry_date = ?, historical_costs = ?, notes = ?, updated_at = ?
+        SET broker_name = ?, country = ?, has_w8ben = ?, w8ben_expiry_date = ?, notes = ?, updated_at = ?
         WHERE id = ?
-    """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, float(historical_costs), notes, now, broker_id))
+    """, (broker_name, country, 1 if has_w8ben else 0, w8ben_expiry_date, notes, now, broker_id))
 
     conn.commit()
     conn.close()
@@ -363,14 +356,6 @@ with tab1:
             w8ben_expiry = None
             if has_w8ben:
                 w8ben_expiry = st.date_input("W-8BEN vervaldatum", help="W-8BEN is normaal 3 jaar geldig", format="DD/MM/YYYY")
-            historical_costs = st.number_input(
-                "Historische kosten (€)",
-                min_value=0.0,
-                value=0.0,
-                step=0.01,
-                format="%.2f",
-                help="Transactiekosten van voor de app, om mee te rekenen in cash balans"
-            )
             notes = st.text_area("Notities (optioneel)")
 
         submit = st.form_submit_button("💾 Broker Opslaan", type="primary")
@@ -378,7 +363,7 @@ with tab1:
         if submit:
             if broker_name:
                 expiry_str = w8ben_expiry.isoformat() if w8ben_expiry else None
-                if add_broker(broker_name, country, has_w8ben, expiry_str, historical_costs, notes):
+                if add_broker(broker_name, country, has_w8ben, expiry_str, notes):
                     st.success(f"✓ Broker '{broker_name}' toegevoegd!")
                     st.rerun()
                 else:
@@ -416,24 +401,13 @@ with tab1:
                         else:
                             expiry_value = datetime.now().date()
                         edit_w8ben_expiry = st.date_input("W-8BEN vervaldatum", value=expiry_value, key=f"expiry_{broker_id}", format="DD/MM/YYYY")
-
-                        hist_costs = row.get('historical_costs', 0) or 0
-                        edit_hist_costs = st.number_input(
-                            "Historische kosten (€)",
-                            min_value=0.0,
-                            value=float(hist_costs),
-                            step=0.01,
-                            format="%.2f",
-                            key=f"hist_{broker_id}",
-                            help="Transactiekosten van voor de app"
-                        )
                         edit_notes = st.text_area("Notities", value=row['notes'] or "", key=f"notes_{broker_id}", height=68)
 
                     col_save, col_delete = st.columns(2)
                     with col_save:
                         if st.form_submit_button("💾 Opslaan", type="primary", use_container_width=True):
                             expiry_str = edit_w8ben_expiry.isoformat() if edit_w8ben else None
-                            update_broker(broker_id, edit_broker_name, edit_country, edit_w8ben, expiry_str, edit_hist_costs, edit_notes)
+                            update_broker(broker_id, edit_broker_name, edit_country, edit_w8ben, expiry_str, edit_notes)
                             st.success("✓ Broker bijgewerkt!")
                             st.rerun()
                     with col_delete:

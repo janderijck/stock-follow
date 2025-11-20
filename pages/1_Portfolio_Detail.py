@@ -47,6 +47,12 @@ def get_connection():
     except sqlite3.OperationalError:
         pass  # Kolom bestaat al
 
+    # Voeg fees_currency kolom toe als die nog niet bestaat
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN fees_currency TEXT DEFAULT 'EUR'")
+    except sqlite3.OperationalError:
+        pass  # Kolom bestaat al
+
     conn.executescript("""
 
     CREATE TABLE IF NOT EXISTS dividends (
@@ -143,6 +149,7 @@ def get_all_purchases(ticker):
         fees as Kosten,
         COALESCE(taxes, 0) as Taxen,
         COALESCE(exchange_rate, 1.0) as Wisselkoers,
+        COALESCE(fees_currency, 'EUR') as fees_currency,
         (quantity * price_per_share) as TotaalAankoop,
         (quantity * price_per_share + fees + COALESCE(taxes, 0)) as Totaal,
         notes as Notities
@@ -394,7 +401,7 @@ def insert_transaction(date, broker, transaction_type, name, ticker, isin, quant
     conn.close()
 
 
-def update_transaction(transaction_id, date, broker, transaction_type, quantity, price_per_share, currency, fees, taxes=0, exchange_rate=1.0, notes=""):
+def update_transaction(transaction_id, date, broker, transaction_type, quantity, price_per_share, currency, fees, taxes=0, exchange_rate=1.0, notes="", fees_currency="EUR"):
     """Update een bestaande transactie."""
     conn = get_connection()
     cur = conn.cursor()
@@ -402,11 +409,11 @@ def update_transaction(transaction_id, date, broker, transaction_type, quantity,
         """
         UPDATE transactions
         SET date = ?, broker = ?, transaction_type = ?, quantity = ?,
-            price_per_share = ?, currency = ?, fees = ?, taxes = ?, exchange_rate = ?, notes = ?
+            price_per_share = ?, currency = ?, fees = ?, taxes = ?, exchange_rate = ?, notes = ?, fees_currency = ?
         WHERE id = ?
         """,
         (date.isoformat(), broker, transaction_type, int(quantity), float(price_per_share),
-         currency, float(fees), float(taxes), float(exchange_rate), notes, transaction_id),
+         currency, float(fees), float(taxes), float(exchange_rate), notes, fees_currency, transaction_id),
     )
     conn.commit()
     conn.close()
@@ -426,7 +433,8 @@ def get_transaction_by_id(transaction_id):
     conn = get_connection()
     query = """
     SELECT id, date, broker, transaction_type, name, ticker, isin,
-           quantity, price_per_share, currency, fees, COALESCE(taxes, 0) as taxes, exchange_rate, notes
+           quantity, price_per_share, currency, fees, COALESCE(taxes, 0) as taxes,
+           exchange_rate, notes, COALESCE(fees_currency, 'EUR') as fees_currency
     FROM transactions
     WHERE id = ?
     """
@@ -605,6 +613,8 @@ with tab1:
                 currency_symbol = '$' if currency == 'USD' else '€' if currency == 'EUR' else '£' if currency == 'GBP' else currency
                 taxes = row.get('Taxen', 0)
                 fees = row.get('Kosten', 0)
+                fees_currency = row.get('fees_currency', 'EUR') or 'EUR'
+                fees_symbol = '$' if fees_currency == 'USD' else '€' if fees_currency == 'EUR' else '£'
 
                 col1, col2, col3, col4, col5, col6, col7 = st.columns([1.5, 1, 1, 1.2, 1.2, 1.5, 0.5])
 
@@ -619,8 +629,8 @@ with tab1:
                     # Prijs in originele valuta
                     st.write(f"{currency_symbol}{row['Prijs/stuk']:.2f}")
                 with col5:
-                    # Kosten en taxen apart
-                    st.write(f"€{fees:.2f} + €{taxes:.2f}")
+                    # Kosten en taxen in hun valuta
+                    st.write(f"{fees_symbol}{fees:.2f} + {fees_symbol}{taxes:.2f}")
                 with col6:
                     # Totaal aankoop in originele valuta
                     st.write(f"**{currency_symbol}{row['TotaalAankoop']:.2f}** ({row['Broker']})")
@@ -667,14 +677,26 @@ with tab1:
                                                         key=f"currency_{tx_id}")
 
                         with edit_col3:
-                            edit_fees = st.number_input("Kosten (€)", min_value=0.0, step=0.01, format="%.2f",
+                            # Valuta voor kosten/taxen
+                            fees_currency_options = ["EUR", "USD", "GBP"]
+                            current_fees_currency = tx_data.get('fees_currency', 'EUR') or 'EUR'
+                            if current_fees_currency in fees_currency_options:
+                                fees_currency_idx = fees_currency_options.index(current_fees_currency)
+                            else:
+                                fees_currency_idx = 0
+                            edit_fees_currency = st.selectbox("Valuta kosten", fees_currency_options,
+                                                              index=fees_currency_idx,
+                                                              key=f"fees_currency_{tx_id}")
+
+                            fees_symbol = '€' if edit_fees_currency == 'EUR' else '$' if edit_fees_currency == 'USD' else '£'
+                            edit_fees = st.number_input(f"Kosten ({fees_symbol})", min_value=0.0, step=0.01, format="%.2f",
                                                        value=float(tx_data['fees']),
                                                        key=f"fees_{tx_id}",
-                                                       help="Broker kosten in EUR")
-                            edit_taxes = st.number_input("Taxen (€)", min_value=0.0, step=0.01, format="%.2f",
+                                                       help=f"Broker kosten in {edit_fees_currency}")
+                            edit_taxes = st.number_input(f"Taxen ({fees_symbol})", min_value=0.0, step=0.01, format="%.2f",
                                                         value=float(tx_data.get('taxes', 0)),
                                                         key=f"taxes_{tx_id}",
-                                                        help="Beurstaks in EUR")
+                                                        help=f"Beurstaks in {edit_fees_currency}")
 
                             # Wisselkoers veld (altijd tonen, maar hint geven)
                             edit_exchange_rate = st.number_input(
@@ -723,7 +745,8 @@ with tab1:
                                     edit_fees,
                                     edit_taxes,
                                     edit_exchange_rate,
-                                    edit_notes
+                                    edit_notes,
+                                    edit_fees_currency
                                 )
                                 st.session_state.editing_transaction = None
                                 st.success("✓ Transactie bijgewerkt!")
@@ -940,31 +963,50 @@ with tab2:
             div_currency = st.selectbox(
                 "Currency",
                 options=["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"],
-                index=0
+                index=1 if stock_info.get('currency', 'EUR') == 'USD' else 0
             )
 
         with col2:
             div_notes = st.text_area("Notities (optioneel)", height=40)
             div_received = st.checkbox(
                 "✅ Ontvangen",
-                value=False,
+                value=True,
                 help="Vink aan als je dit dividend al ontvangen hebt"
             )
-            div_tax_paid = st.checkbox(
-                "💰 Tax betaald",
-                value=False,
-                help="Vink aan als je belasting betaald hebt (kan alleen als dividend ontvangen is)"
-            )
 
-        st.info("ℹ️ Tax kan alleen betaald zijn als dividend ontvangen is")
+        # Belasting sectie
+        st.write("**💰 Belasting**")
+        tax_col1, tax_col2 = st.columns(2)
+
+        with tax_col1:
+            us_withholding = st.number_input(
+                "🇺🇸 US Bronheffing",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="15% voor W-8BEN, 30% zonder"
+            )
+            us_tax_paid = st.checkbox("US tax betaald", value=False)
+
+        with tax_col2:
+            be_tax = st.number_input(
+                "🇧🇪 Belgische RV",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="30% roerende voorheffing"
+            )
+            be_tax_paid = st.checkbox("BE tax betaald", value=False)
 
         div_submitted = st.form_submit_button("💾 Dividend opslaan", type="primary")
 
         if div_submitted and div_amount > 0:
-            final_tax_paid = div_tax_paid and div_received
+            # Bereken netto ontvangen
+            total_tax = us_withholding + be_tax
+            net_received = div_amount - total_tax
 
-            if div_tax_paid and not div_received:
-                st.warning("⚠️ Tax betaald is uitgezet omdat dividend nog niet ontvangen is")
+            # Tax is betaald als beide zijn aangevinkt (of als er geen tax is)
+            final_tax_paid = (us_tax_paid or us_withholding == 0) and (be_tax_paid or be_tax == 0)
 
             add_dividend(
                 ticker,
@@ -976,7 +1018,23 @@ with tab2:
                 final_tax_paid,
                 div_received
             )
-            st.success(f"✓ Dividend van {format_currency(div_amount, div_currency)} toegevoegd!")
+
+            # Update met de handmatige tax waarden
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE dividends
+                SET withheld_amount = ?, additional_tax_due = ?, net_received = ?
+                WHERE id = (
+                    SELECT id FROM dividends
+                    WHERE ticker = ? AND ex_date = ?
+                    ORDER BY id DESC LIMIT 1
+                )
+            """, (us_withholding, be_tax, net_received, ticker, div_date.isoformat()))
+            conn.commit()
+            conn.close()
+
+            st.success(f"✓ Dividend van {format_currency(div_amount, div_currency)} toegevoegd! Netto: {format_currency(net_received, div_currency)}")
             st.rerun()
 
 with tab3:

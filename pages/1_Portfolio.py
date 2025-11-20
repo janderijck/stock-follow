@@ -45,6 +45,14 @@ def get_connection():
     );
     """)
 
+    # Voeg fees_currency kolom toe als die nog niet bestaat
+    cursor = conn.cursor()
+    try:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN fees_currency TEXT DEFAULT 'EUR'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Kolom bestaat al
+
     return conn
 
 
@@ -332,25 +340,6 @@ def convert_to_eur(amount, currency, exchange_rate=None):
     # Haal huidige wisselkoers op
     rate = get_current_exchange_rate(currency, 'EUR')
     return amount * rate
-
-
-def get_total_historical_costs():
-    """Haalt totale historische kosten op van alle brokers."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Voeg historical_costs kolom toe als die nog niet bestaat
-    try:
-        cursor.execute("ALTER TABLE broker_settings ADD COLUMN historical_costs REAL DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Kolom bestaat al
-
-    cursor.execute("SELECT SUM(COALESCE(historical_costs, 0)) FROM broker_settings")
-    result = cursor.fetchone()
-    conn.close()
-
-    return result[0] if result and result[0] else 0
 
 
 def get_yahoo_ticker_override(ticker):
@@ -643,6 +632,7 @@ def get_portfolio_holdings():
 
     # Haal alle transacties op met broker info
     # Voor EUR berekening: gebruik gewogen gemiddelde exchange_rate voor aankopen
+    # Fees: als fees_currency = EUR, gebruik direct; anders converteer met exchange_rate
     query = """
     SELECT
         ticker,
@@ -651,12 +641,18 @@ def get_portfolio_holdings():
         transaction_type,
         SUM(CASE WHEN transaction_type = 'BUY' THEN quantity ELSE -quantity END) as total_quantity,
         SUM(CASE WHEN transaction_type = 'BUY' THEN quantity * price_per_share ELSE 0 END) as total_invested,
-        SUM(CASE WHEN transaction_type = 'BUY' THEN fees ELSE 0 END) as total_fees,
+        SUM(CASE WHEN transaction_type = 'BUY' THEN fees + COALESCE(taxes, 0) ELSE 0 END) as total_fees,
         currency,
         MIN(date) as first_purchase_date,
         (SELECT broker FROM transactions t2 WHERE t2.ticker = transactions.ticker ORDER BY date DESC LIMIT 1) as broker,
         SUM(CASE WHEN transaction_type = 'BUY' THEN quantity * price_per_share * COALESCE(exchange_rate, 1.0) ELSE 0 END) as total_invested_eur,
-        SUM(CASE WHEN transaction_type = 'BUY' THEN fees * COALESCE(exchange_rate, 1.0) ELSE 0 END) as total_fees_eur
+        SUM(CASE WHEN transaction_type = 'BUY' THEN
+            CASE WHEN COALESCE(fees_currency, 'EUR') = 'EUR'
+                THEN fees + COALESCE(taxes, 0)
+                ELSE (fees + COALESCE(taxes, 0)) * COALESCE(exchange_rate, 1.0)
+            END
+        ELSE 0 END) as total_fees_eur,
+        AVG(CASE WHEN transaction_type = 'BUY' THEN COALESCE(exchange_rate, 1.0) END) as avg_exchange_rate
     FROM transactions
     GROUP BY ticker, isin, name, currency
     HAVING total_quantity > 0
@@ -1169,10 +1165,18 @@ with st.spinner(spinner_text):
         if price_info and 'error' not in price_info:
             current_price = price_info['current_price']
 
-            # Haal wisselkoers op voor deze valuta
-            current_exchange_rate = exchange_rates.get(currency, 1.0)
+            # Gebruik de gemiddelde wisselkoers van de aankopen
+            # Als exchange_rate = 1.0 voor USD, dan geen conversie (USD rekening)
+            avg_exchange_rate = row.get('avg_exchange_rate', 1.0)
 
-            # Bereken performance (inclusief dividenden) - alles in EUR
+            # Als de originele transactie geen conversie had (rate = 1.0),
+            # gebruik dan ook 1.0 voor huidige prijs (blijf in originele valuta)
+            if currency != 'EUR' and avg_exchange_rate == 1.0:
+                current_exchange_rate = 1.0  # Geen conversie - USD rekening
+            else:
+                current_exchange_rate = exchange_rates.get(currency, 1.0)
+
+            # Bereken performance (inclusief dividenden)
             perf = calculate_performance(
                 row['avg_purchase_price_eur'],
                 current_price,
@@ -1185,26 +1189,38 @@ with st.spinner(spinner_text):
             # Haal dividend info op
             div_info = calculate_total_dividends(ticker)
 
-            # Display: toon aankoopprijs in EUR, huidige prijs ook in EUR
+            # Bepaal valutasymbool voor display
+            is_usd_account = (currency == 'USD' and avg_exchange_rate == 1.0)
+            display_symbol = '$' if is_usd_account else '€'
+
+            # Bereken W/V in EUR voor USD aandelen (met huidige wisselkoers)
+            actual_eur_rate = exchange_rates.get(currency, 1.0) if currency != 'EUR' else 1.0
+            wv_in_eur = perf['total_gain_loss'] * actual_eur_rate if is_usd_account else perf['total_gain_loss']
+            invested_in_eur = perf['total_invested'] * actual_eur_rate if is_usd_account else perf['total_invested']
+
             portfolio_data.append({
                 'Aandeel': row['name'],
                 'Ticker': ticker,
                 'Broker': broker,
                 'ISIN': row['isin'],
                 'Aantal': int(row['total_quantity']),
-                'Avg Aankoopprijs': f"€{row['avg_purchase_price_eur']:.2f}",
-                'Huidige Prijs': f"€{perf['current_price_eur']:.2f}",
-                'Totaal Geinvesteerd': f"€{perf['total_invested']:.2f}",
-                'Huidige Waarde': f"€{perf['current_value']:.2f}",
+                'Avg Aankoopprijs': f"{display_symbol}{row['avg_purchase_price_eur']:.2f}",
+                'Huidige Prijs': f"{display_symbol}{perf['current_price_eur']:.2f}",
+                'Totaal Geinvesteerd': f"{display_symbol}{perf['total_invested']:.2f}",
+                'Huidige Waarde': f"{display_symbol}{perf['current_value']:.2f}",
                 'Dividend (netto)': f"€{div_info['total_netto']:.2f}",
-                'W/V (excl. div)': f"€{perf['total_gain_loss_excl_div']:.2f}",
-                'W/V (incl. div)': f"€{perf['total_gain_loss']:.2f}",
+                'W/V (excl. div)': f"{display_symbol}{perf['total_gain_loss_excl_div']:.2f}",
+                'W/V (incl. div)': f"{display_symbol}{perf['total_gain_loss']:.2f}",
                 'Performance': f"{perf['gain_loss_percent']:+.2f}%",
                 '_current_price': current_price,
                 '_perf': perf,
                 '_avg_price': row['avg_purchase_price_eur'],
                 '_quantity': row['total_quantity'],
-                '_currency': currency
+                '_currency': currency,
+                '_is_usd_account': is_usd_account,
+                '_wv_in_eur': wv_in_eur,
+                '_invested_in_eur': invested_in_eur,
+                '_display_symbol': display_symbol
             })
         else:
             # Kon prijs niet ophalen
@@ -1233,14 +1249,25 @@ portfolio_df = pd.DataFrame(portfolio_data)
 if portfolio_df.empty:
     st.info("Geen aandelen gevonden met de huidige filters.")
 else:
-    # Bereken totalen alleen als er data is
+    # Bereken totalen alleen als er data is (alles in EUR)
     if portfolio_data:
-        total_invested_stocks = sum([row['_perf']['total_invested'] for row in portfolio_data if '_perf' in row and isinstance(row['_perf'], dict)])
-        # Voeg historische kosten toe aan totaal geïnvesteerd
-        historical_costs = get_total_historical_costs()
-        total_invested = total_invested_stocks + historical_costs
+        total_invested = 0
+        total_current = 0
 
-        total_current = sum([row['_perf']['current_value'] for row in portfolio_data if '_perf' in row and isinstance(row['_perf'], dict)])
+        for row in portfolio_data:
+            if '_perf' not in row or not isinstance(row['_perf'], dict):
+                continue
+
+            if row.get('_is_usd_account'):
+                # USD rekening: converteer naar EUR met huidige wisselkoers
+                total_invested += row.get('_invested_in_eur', row['_perf']['total_invested'])
+                # current_value in USD * EUR/USD rate
+                currency = row.get('_currency', 'EUR')
+                eur_rate = exchange_rates.get(currency, 1.0)
+                total_current += row['_perf']['current_value'] * eur_rate
+            else:
+                total_invested += row['_perf']['total_invested']
+                total_current += row['_perf']['current_value']
         total_dividends = sum([row['_perf']['total_dividends_netto'] for row in portfolio_data if '_perf' in row and isinstance(row['_perf'], dict)])
         total_gain_loss_excl = total_current - total_invested
         total_gain_loss_incl = total_gain_loss_excl + total_dividends
@@ -1277,9 +1304,6 @@ else:
             st.write("### Gebruikte Wisselkoersen")
             for curr, rate in exchange_rates.items():
                 st.write(f"**{curr}/EUR:** {rate:.4f}")
-
-            if historical_costs > 0:
-                st.write(f"**Historische kosten:** €{historical_costs:.2f}")
 
             st.divider()
             st.write("### Waarde per Aandeel")
@@ -1430,10 +1454,19 @@ else:
             st.markdown(f"<small>{row['Totaal Geinvesteerd']}</small>", unsafe_allow_html=True)
 
         with col6:
-            # Winst/Verlies in currency (incl. dividend)
+            # Winst/Verlies
             if '_perf' in row and isinstance(row['_perf'], dict):
                 wv = row['_perf']['total_gain_loss']
-                st.markdown(f"<small style='color: {perf_color};'><b>{currency_symbol}{wv:+.2f}</b></small>", unsafe_allow_html=True)
+                display_symbol = row.get('_display_symbol', '€')
+                is_usd_account = row.get('_is_usd_account', False)
+
+                if is_usd_account:
+                    # Toon zowel USD als EUR
+                    wv_eur = row.get('_wv_in_eur', wv)
+                    eur_color = "green" if wv_eur >= 0 else "red"
+                    st.markdown(f"<small style='color: {perf_color};'><b>{display_symbol}{wv:+.2f}</b></small><br><small style='color: {eur_color};'>€{wv_eur:+.2f}</small>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"<small style='color: {perf_color};'><b>€{wv:+.2f}</b></small>", unsafe_allow_html=True)
             else:
                 st.markdown("<small>N/A</small>", unsafe_allow_html=True)
 
