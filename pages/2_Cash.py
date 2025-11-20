@@ -223,6 +223,36 @@ def calculate_currency_gain_loss_per_broker():
     return result
 
 
+def get_broker_currency_info(broker):
+    """Haalt valuta informatie op voor een broker - checkt of het een USD rekening is."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Check of broker USD transacties heeft met exchange_rate = 1.0 (USD account)
+    cursor.execute("""
+        SELECT COUNT(*) FROM transactions
+        WHERE broker = ? AND currency = 'USD' AND COALESCE(exchange_rate, 1.0) = 1.0
+    """, (broker,))
+    usd_count = cursor.fetchone()[0]
+
+    # Haal totalen in USD op
+    cursor.execute("""
+        SELECT
+            SUM(CASE WHEN transaction_type = 'BUY' THEN quantity * price_per_share + fees ELSE 0 END) as total_invested_usd,
+            SUM(CASE WHEN transaction_type = 'BUY' THEN quantity ELSE -quantity END) as total_quantity
+        FROM transactions
+        WHERE broker = ? AND currency = 'USD' AND COALESCE(exchange_rate, 1.0) = 1.0
+    """, (broker,))
+    result = cursor.fetchone()
+
+    conn.close()
+
+    return {
+        'is_usd_account': usd_count > 0,
+        'total_invested_usd': result[0] or 0 if result else 0
+    }
+
+
 def get_portfolio_value_per_broker():
     """Berekent de huidige portfolio waarde per broker."""
     conn = get_connection()
@@ -508,47 +538,159 @@ else:
         broker_currency_gain = currency_gains.get(broker, {})
         currency_gain_loss = broker_currency_gain.get('gain_loss_source', 0)
 
+        # Check of dit een USD broker is
+        broker_info = get_broker_currency_info(broker)
+        is_usd_broker = broker_info['is_usd_account']
+
         with st.expander(f"**{broker}** - Cash: €{expected_cash:,.2f}", expanded=True):
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            if is_usd_broker:
+                # Haal USD specifieke data op
+                current_eur_usd = get_cached_exchange_rate('EUR', 'USD')
 
-            with col1:
-                st.metric("Gestort", f"€{total_deposits:,.2f}")
+                # Haal stortingen in USD op (dest_amount)
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT
+                        SUM(CASE WHEN transaction_type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits_usd,
+                        SUM(CASE WHEN transaction_type = 'WITHDRAWAL' THEN amount ELSE 0 END) as withdrawals_usd,
+                        SUM(CASE WHEN transaction_type = 'DEPOSIT' THEN COALESCE(source_amount, amount) ELSE 0 END) as deposits_eur,
+                        AVG(CASE WHEN transaction_type = 'DEPOSIT' AND source_currency = 'EUR' THEN exchange_rate END) as avg_deposit_rate
+                    FROM cash_transactions
+                    WHERE broker = ? AND currency = 'USD'
+                """, (broker,))
+                usd_cash = cursor.fetchone()
+                deposits_usd = usd_cash[0] or 0
+                withdrawals_usd = usd_cash[1] or 0
+                deposits_eur = usd_cash[2] or 0
+                avg_deposit_rate = usd_cash[3] or current_eur_usd
 
-            with col2:
-                st.metric("Opgenomen", f"€{total_withdrawals:,.2f}")
+                # Haal USD portfolio waarde
+                cursor.execute("""
+                    SELECT
+                        SUM(CASE WHEN transaction_type = 'BUY' THEN quantity * price_per_share + fees ELSE 0 END) as purchases_usd,
+                        SUM(CASE WHEN transaction_type = 'SELL' THEN quantity * price_per_share - fees ELSE 0 END) as sales_usd
+                    FROM transactions
+                    WHERE broker = ? AND currency = 'USD'
+                """, (broker,))
+                usd_tx = cursor.fetchone()
+                purchases_usd = usd_tx[0] or 0
+                sales_usd = usd_tx[1] or 0
 
-            with col3:
-                st.metric("Aankopen", f"€{total_purchases:,.2f}")
+                # Haal USD dividenden
+                cursor.execute("""
+                    SELECT SUM(COALESCE(d.net_received, d.bruto_amount)) as dividends_usd
+                    FROM dividends d
+                    WHERE d.received = 1 AND d.currency = 'USD'
+                    AND d.ticker IN (SELECT DISTINCT ticker FROM transactions WHERE broker = ?)
+                """, (broker,))
+                div_result = cursor.fetchone()
+                dividends_usd = div_result[0] or 0
 
-            with col4:
-                st.metric("Verkopen", f"€{total_sales:,.2f}")
+                conn.close()
 
-            with col5:
-                st.metric("Dividenden", f"€{total_dividends:,.2f}")
+                # Bereken USD waarden
+                cash_usd = deposits_usd - withdrawals_usd - purchases_usd + sales_usd + dividends_usd
+                total_value_usd = portfolio_value + cash_usd  # portfolio_value is al in EUR hier, dit klopt niet helemaal
 
-            with col6:
-                if currency_gain_loss != 0:
-                    st.metric("Koers W/V", f"€{currency_gain_loss:,.2f}",
-                             delta=f"{'winst' if currency_gain_loss > 0 else 'verlies'}",
-                             delta_color="normal" if currency_gain_loss > 0 else "inverse")
-                else:
-                    st.metric("Koers W/V", "€0.00")
+                # USD SECTIE
+                st.markdown("### 💵 USD Rekening")
+                col1, col2, col3, col4, col5 = st.columns(5)
 
-            st.divider()
+                with col1:
+                    st.metric("Gestort", f"${deposits_usd:,.2f}")
+                with col2:
+                    st.metric("Opgenomen", f"${withdrawals_usd:,.2f}")
+                with col3:
+                    st.metric("Aankopen", f"${purchases_usd:,.2f}")
+                with col4:
+                    st.metric("Verkopen", f"${sales_usd:,.2f}")
+                with col5:
+                    st.metric("Dividenden", f"${dividends_usd:,.2f}")
 
-            col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Cash Beschikbaar", f"${cash_usd:,.2f}")
+                with col2:
+                    # Portfolio waarde in USD - we moeten dit nog correct berekenen
+                    st.metric("Gem. Stortingskoers", f"{avg_deposit_rate:.4f}")
 
-            with col1:
-                st.metric("Cash Beschikbaar", f"€{expected_cash:,.2f}")
+                st.divider()
 
-            with col2:
-                st.metric("Portfolio Waarde", f"€{portfolio_value:,.2f}")
+                # EUR SECTIE
+                st.markdown("### 💶 EUR Equivalent")
 
-            with col3:
-                # Rendement = winst/verlies t.o.v. netto inleg
-                pct = (profit_loss / net_deposited * 100) if net_deposited > 0 else 0
-                st.metric("Totale Waarde", f"€{total_value:,.2f}",
-                         delta=f"{pct:+.1f}%")
+                # Omrekenen naar EUR
+                deposits_eur_current = deposits_usd / current_eur_usd if current_eur_usd else 0
+                cash_eur = cash_usd / current_eur_usd if current_eur_usd else 0
+                koers_wv = deposits_eur_current - deposits_eur  # Verschil door koersverandering
+
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Gestort (bij storting)", f"€{deposits_eur:,.2f}",
+                             help=f"Totaal EUR betaald bij stortingen")
+                with col2:
+                    st.metric("Gestort (huidige koers)", f"€{deposits_eur_current:,.2f}",
+                             help=f"${deposits_usd:,.2f} × {1/current_eur_usd:.4f}")
+                with col3:
+                    st.metric("Cash Beschikbaar", f"€{cash_eur:,.2f}")
+                with col4:
+                    st.metric("Koers W/V", f"€{koers_wv:,.2f}",
+                             delta=f"{'winst' if koers_wv > 0 else 'verlies'}",
+                             delta_color="normal" if koers_wv > 0 else "inverse")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Huidige EUR/USD", f"{current_eur_usd:.4f}")
+                with col2:
+                    st.metric("Portfolio Waarde", f"€{portfolio_value:,.2f}")
+                with col3:
+                    pct = (profit_loss / net_deposited * 100) if net_deposited > 0 else 0
+                    st.metric("Totale Waarde", f"€{total_value:,.2f}",
+                             delta=f"{pct:+.1f}%")
+
+            else:
+                # Normale EUR weergave
+                col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+                with col1:
+                    st.metric("Gestort", f"€{total_deposits:,.2f}")
+
+                with col2:
+                    st.metric("Opgenomen", f"€{total_withdrawals:,.2f}")
+
+                with col3:
+                    st.metric("Aankopen", f"€{total_purchases:,.2f}")
+
+                with col4:
+                    st.metric("Verkopen", f"€{total_sales:,.2f}")
+
+                with col5:
+                    st.metric("Dividenden", f"€{total_dividends:,.2f}")
+
+                with col6:
+                    if currency_gain_loss != 0:
+                        st.metric("Koers W/V", f"€{currency_gain_loss:,.2f}",
+                                 delta=f"{'winst' if currency_gain_loss > 0 else 'verlies'}",
+                                 delta_color="normal" if currency_gain_loss > 0 else "inverse")
+                    else:
+                        st.metric("Koers W/V", "€0.00")
+
+                st.divider()
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    st.metric("Cash Beschikbaar", f"€{expected_cash:,.2f}")
+
+                with col2:
+                    st.metric("Portfolio Waarde", f"€{portfolio_value:,.2f}")
+
+                with col3:
+                    # Rendement = winst/verlies t.o.v. netto inleg
+                    pct = (profit_loss / net_deposited * 100) if net_deposited > 0 else 0
+                    st.metric("Totale Waarde", f"€{total_value:,.2f}",
+                             delta=f"{pct:+.1f}%")
 
 st.divider()
 

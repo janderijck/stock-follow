@@ -308,7 +308,8 @@ def calculate_total_dividends(ticker, filter_ownership=False):
             'total_tax': 0,
             'total_netto': 0,
             'count': 0,
-            'received_count': 0
+            'received_count': 0,
+            'currency': 'EUR'
         }
 
     # Filter alleen ontvangen dividenden
@@ -320,7 +321,8 @@ def calculate_total_dividends(ticker, filter_ownership=False):
             'total_tax': 0,
             'total_netto': 0,
             'count': len(df),
-            'received_count': 0
+            'received_count': 0,
+            'currency': df['currency'].iloc[0] if 'currency' in df.columns and len(df) > 0 else 'EUR'
         }
 
     # Use intelligent tax calculator
@@ -357,12 +359,16 @@ def calculate_total_dividends(ticker, filter_ownership=False):
             # Geen tax betaald
             total_netto += row['bruto_amount']
 
+    # Bepaal meest voorkomende currency
+    div_currency = received_df['currency'].mode().iloc[0] if 'currency' in received_df.columns and len(received_df) > 0 else 'EUR'
+
     return {
         'total_bruto': total_bruto,
         'total_tax': total_tax,
         'total_netto': total_netto,
         'count': len(df),
-        'received_count': len(received_df)
+        'received_count': len(received_df),
+        'currency': div_currency
     }
 
 
@@ -793,21 +799,21 @@ with tab2:
             st.session_state.editing_dividend = None
 
         # Header rij
-        header_col1, header_col2, header_col3, header_col4, header_col5, header_col6, header_col7, header_col8 = st.columns([1.5, 0.8, 1, 1, 1, 0.8, 0.8, 0.5])
+        header_col1, header_col2, header_col3, header_col4, header_col5, header_col6, header_col7, header_col8 = st.columns([1.2, 1, 1, 1, 1, 1, 0.8, 0.5])
         with header_col1:
             st.markdown("**Datum**")
         with header_col2:
-            st.markdown("**Currency**")
-        with header_col3:
             st.markdown("**Bruto**")
+        with header_col3:
+            st.markdown("**🇺🇸 US Tax**")
         with header_col4:
-            st.markdown("**Tax**")
+            st.markdown("**🇧🇪 BE Tax**")
         with header_col5:
             st.markdown("**Netto**")
         with header_col6:
-            st.markdown("**Tax ✓**")
-        with header_col7:
             st.markdown("**Ontv ✓**")
+        with header_col7:
+            st.markdown("")
         with header_col8:
             st.markdown("")
 
@@ -823,37 +829,54 @@ with tab2:
             tax_paid = row.get('tax_paid', 1)
             received = row.get('received', 0)
 
+            # Haal handmatige tax waarden op
+            us_tax = row.get('withheld_amount', 0) or 0
+            be_tax = row.get('additional_tax_due', 0) or 0
+            net_received = row.get('net_received')
+
             # BELANGRIJKE REGEL: Tax kan alleen betaald zijn als dividend ontvangen is
             if not received:
                 tax_paid = 0
 
-            # Bereken tax voor display
-            if tax_paid:
+            # Bereken netto
+            if net_received:
+                netto = net_received
+            elif us_tax > 0 or be_tax > 0:
+                netto = bruto - us_tax - be_tax
+            elif tax_paid:
                 tax_result = tax_calc.calculate_tax(bruto, ticker, broker)
-                tax = tax_result['total_tax']
+                us_tax = tax_result.get('us_withholding', 0)
+                be_tax = tax_result.get('belgian_tax', 0)
                 netto = tax_result['net_amount']
             else:
-                tax = 0
                 netto = bruto
 
             if not is_editing:
                 # View mode
-                col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([1.5, 0.8, 1, 1, 1, 0.8, 0.8, 0.5])
+                col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([1.2, 1, 1, 1, 1, 1, 0.8, 0.5])
 
                 with col1:
                     st.write(f"**{row['ex_date']}**")
                 with col2:
-                    st.write(currency)
-                with col3:
                     st.write(format_currency(bruto, currency))
+                with col3:
+                    # US Tax in originele currency met betaald indicator
+                    if us_tax > 0:
+                        st.write(f"{format_currency(us_tax, currency)} ✅")
+                    else:
+                        st.write("-")
                 with col4:
-                    st.write(format_currency(tax, currency) if tax_paid else "-")
+                    # BE Tax in EUR met betaald indicator
+                    if be_tax > 0:
+                        st.write(f"€{be_tax:.2f} ✅")
+                    else:
+                        st.write("-")
                 with col5:
                     st.write(format_currency(netto, currency))
                 with col6:
-                    st.write("✅" if tax_paid else "❌")
-                with col7:
                     st.write("✅" if received else "❌")
+                with col7:
+                    st.write("")
                 with col8:
                     if st.button("✏️", key=f"edit_div_{div_id}", help="Bewerk dividend"):
                         st.session_state.editing_dividend = div_id
@@ -933,14 +956,18 @@ with tab2:
         st.write(f"### 📊 Ontvangen Dividenden ({div_info['received_count']}/{div_info['count']})")
         col1, col2, col3 = st.columns(3)
 
+        # Bepaal currency symbool
+        div_currency = div_info.get('currency', 'EUR')
+        div_symbol = '$' if div_currency == 'USD' else '€' if div_currency == 'EUR' else '£'
+
         with col1:
-            st.metric("Totaal Bruto (ontvangen)", f"€{div_info['total_bruto']:.2f}")
+            st.metric("Totaal Bruto (ontvangen)", f"{div_symbol}{div_info['total_bruto']:.2f}")
 
         with col2:
-            st.metric("Totaal Tax Betaald", f"€{div_info['total_tax']:.2f}")
+            st.metric("Totaal Tax Betaald", f"{div_symbol}{div_info['total_tax']:.2f}")
 
         with col3:
-            st.metric("Totaal Netto (ontvangen)", f"€{div_info['total_netto']:.2f}")
+            st.metric("Totaal Netto (ontvangen)", f"{div_symbol}{div_info['total_netto']:.2f}")
     else:
         st.info("Nog geen dividenden toegevoegd.")
 
@@ -948,7 +975,41 @@ with tab2:
     st.divider()
     st.subheader("➕ Nieuw Dividend Toevoegen")
 
+    # Haal laatste dividend per share op van yfinance
+    default_div_per_share = 0.0
+    default_bruto = 0.0
+    default_us_tax = 0.0
+    div_currency_default = 'USD' if stock_info.get('currency', 'EUR') == 'USD' else 'EUR'
+
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        # Probeer laatste dividend te halen
+        last_dividend = info.get('lastDividendValue', 0) or info.get('dividendRate', 0) or 0
+        if last_dividend and last_dividend > 0:
+            # Voor kwartaal dividend, deel door 4 als het jaarlijks is
+            div_frequency = info.get('dividendYield', 0)
+            default_div_per_share = last_dividend
+
+            # Bereken totaal bruto
+            quantity = stock_info.get('total_quantity', 0)
+            default_bruto = round(default_div_per_share * quantity, 2)
+
+            # Bereken 15% US bronheffing
+            default_us_tax = round(default_bruto * 0.15, 2)
+
+            # Haal currency op
+            div_currency_default = info.get('currency', 'USD')
+    except:
+        pass
+
     with st.form("dividend_form"):
+        # Toon dividend info als beschikbaar
+        if default_div_per_share > 0:
+            symbol = '$' if div_currency_default == 'USD' else '€' if div_currency_default == 'EUR' else '£' if div_currency_default == 'GBP' else ''
+            st.info(f"💡 Laatste dividend: {symbol}{default_div_per_share:.2f}/aandeel × {int(stock_info.get('total_quantity', 0))} = {symbol}{default_bruto:.2f}")
+
         col1, col2 = st.columns(2)
 
         with col1:
@@ -956,14 +1017,17 @@ with tab2:
             div_amount = st.number_input(
                 "Bruto bedrag",
                 min_value=0.0,
+                value=default_bruto,
                 step=0.01,
                 format="%.2f",
                 help="Voer het totale bruto dividend in (voor al je aandelen)"
             )
+            currency_options = ["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"]
+            currency_index = currency_options.index(div_currency_default) if div_currency_default in currency_options else 1
             div_currency = st.selectbox(
                 "Currency",
-                options=["EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY"],
-                index=1 if stock_info.get('currency', 'EUR') == 'USD' else 0
+                options=currency_options,
+                index=currency_index
             )
 
         with col2:
@@ -982,6 +1046,7 @@ with tab2:
             us_withholding = st.number_input(
                 "🇺🇸 US Bronheffing",
                 min_value=0.0,
+                value=default_us_tax,
                 step=0.01,
                 format="%.2f",
                 help="15% voor W-8BEN, 30% zonder"

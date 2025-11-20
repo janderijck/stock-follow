@@ -564,7 +564,8 @@ def calculate_total_dividends(ticker, filter_ownership=True):
             'total_tax': 0,
             'total_netto': 0,
             'count': 0,
-            'received_count': 0
+            'received_count': 0,
+            'currency': 'EUR'
         }
 
     # Filter alleen ontvangen dividenden
@@ -576,7 +577,8 @@ def calculate_total_dividends(ticker, filter_ownership=True):
             'total_tax': 0,
             'total_netto': 0,
             'count': len(df),
-            'received_count': 0
+            'received_count': 0,
+            'currency': df['currency'].iloc[0] if 'currency' in df.columns and len(df) > 0 else 'EUR'
         }
 
     # Use intelligent tax calculator
@@ -613,12 +615,16 @@ def calculate_total_dividends(ticker, filter_ownership=True):
             # Geen tax betaald
             total_netto += row['bruto_amount']
 
+    # Bepaal meest voorkomende currency
+    div_currency = received_df['currency'].mode().iloc[0] if 'currency' in received_df.columns and len(received_df) > 0 else 'EUR'
+
     return {
         'total_bruto': total_bruto,
         'total_tax': total_tax,
         'total_netto': total_netto,
         'count': len(df),
-        'received_count': len(received_df)
+        'received_count': len(received_df),
+        'currency': div_currency
     }
 
 
@@ -1196,7 +1202,13 @@ with st.spinner(spinner_text):
             # Bereken W/V in EUR voor USD aandelen (met huidige wisselkoers)
             actual_eur_rate = exchange_rates.get(currency, 1.0) if currency != 'EUR' else 1.0
             wv_in_eur = perf['total_gain_loss'] * actual_eur_rate if is_usd_account else perf['total_gain_loss']
+            wv_excl_in_eur = perf['total_gain_loss_excl_div'] * actual_eur_rate if is_usd_account else perf['total_gain_loss_excl_div']
             invested_in_eur = perf['total_invested'] * actual_eur_rate if is_usd_account else perf['total_invested']
+
+            # Dividend currency en EUR equivalent
+            div_currency = div_info.get('currency', 'EUR')
+            div_symbol = '$' if div_currency == 'USD' else '€' if div_currency == 'EUR' else '£'
+            div_in_eur = div_info['total_netto'] * actual_eur_rate if div_currency == 'USD' and actual_eur_rate != 1.0 else div_info['total_netto']
 
             portfolio_data.append({
                 'Aandeel': row['name'],
@@ -1208,19 +1220,22 @@ with st.spinner(spinner_text):
                 'Huidige Prijs': f"{display_symbol}{perf['current_price_eur']:.2f}",
                 'Totaal Geinvesteerd': f"{display_symbol}{perf['total_invested']:.2f}",
                 'Huidige Waarde': f"{display_symbol}{perf['current_value']:.2f}",
-                'Dividend (netto)': f"€{div_info['total_netto']:.2f}",
+                'Dividend (netto)': f"{div_symbol}{div_info['total_netto']:.2f}",
                 'W/V (excl. div)': f"{display_symbol}{perf['total_gain_loss_excl_div']:.2f}",
                 'W/V (incl. div)': f"{display_symbol}{perf['total_gain_loss']:.2f}",
                 'Performance': f"{perf['gain_loss_percent']:+.2f}%",
                 '_current_price': current_price,
                 '_perf': perf,
-                '_avg_price': row['avg_purchase_price_eur'],
+                '_avg_price': row['avg_purchase_price'] if is_usd_account else row['avg_purchase_price_eur'],
                 '_quantity': row['total_quantity'],
                 '_currency': currency,
                 '_is_usd_account': is_usd_account,
                 '_wv_in_eur': wv_in_eur,
+                '_wv_excl_in_eur': wv_excl_in_eur,
                 '_invested_in_eur': invested_in_eur,
-                '_display_symbol': display_symbol
+                '_display_symbol': display_symbol,
+                '_div_in_eur': div_in_eur,
+                '_div_currency': div_currency
             })
         else:
             # Kon prijs niet ophalen
@@ -1249,53 +1264,111 @@ portfolio_df = pd.DataFrame(portfolio_data)
 if portfolio_df.empty:
     st.info("Geen aandelen gevonden met de huidige filters.")
 else:
-    # Bereken totalen alleen als er data is (alles in EUR)
+    # Bereken totalen alleen als er data is - splits EUR en USD
     if portfolio_data:
-        total_invested = 0
-        total_current = 0
+        # EUR totalen
+        eur_invested = 0
+        eur_current = 0
+        eur_wv_excl = 0
+        eur_dividends = 0
+
+        # USD totalen (originele USD waarden)
+        usd_invested = 0
+        usd_current = 0
+        usd_wv_excl = 0
+        usd_dividends = 0
+
+        has_usd = False
 
         for row in portfolio_data:
             if '_perf' not in row or not isinstance(row['_perf'], dict):
                 continue
 
             if row.get('_is_usd_account'):
-                # USD rekening: converteer naar EUR met huidige wisselkoers
-                total_invested += row.get('_invested_in_eur', row['_perf']['total_invested'])
-                # current_value in USD * EUR/USD rate
-                currency = row.get('_currency', 'EUR')
-                eur_rate = exchange_rates.get(currency, 1.0)
-                total_current += row['_perf']['current_value'] * eur_rate
+                has_usd = True
+                # USD waarden in originele dollars
+                usd_invested += row['_perf']['total_invested']
+                usd_current += row['_perf']['current_value']
+                usd_wv_excl += row['_perf']['total_gain_loss_excl_div']
+                # USD dividenden
+                usd_dividends += row['_perf']['total_dividends_netto']
             else:
-                total_invested += row['_perf']['total_invested']
-                total_current += row['_perf']['current_value']
-        total_dividends = sum([row['_perf']['total_dividends_netto'] for row in portfolio_data if '_perf' in row and isinstance(row['_perf'], dict)])
-        total_gain_loss_excl = total_current - total_invested
-        total_gain_loss_incl = total_gain_loss_excl + total_dividends
-        total_gain_loss_percent = (total_gain_loss_incl / total_invested * 100) if total_invested > 0 else 0
+                # EUR waarden
+                eur_invested += row['_perf']['total_invested']
+                eur_current += row['_perf']['current_value']
+                eur_wv_excl += row['_perf']['total_gain_loss_excl_div']
+                eur_dividends += row['_perf']['total_dividends_netto']
 
         # Toon totalen BOVENAAN
-        col1, col2, col3, col4, col5 = st.columns(5)
+        if has_usd:
+            # EUR sectie
+            st.markdown("### 💶 EUR Portfolio")
+            col1, col2, col3, col4, col5 = st.columns(5)
 
-        with col1:
-            st.metric("Totaal Geinvesteerd", f"€{total_invested:,.2f}")
+            with col1:
+                st.metric("Geïnvesteerd", f"€{eur_invested:,.2f}")
+            with col2:
+                st.metric("Huidige Waarde", f"€{eur_current:,.2f}")
+            with col3:
+                st.metric("Dividend", f"€{eur_dividends:,.2f}")
+            with col4:
+                eur_wv_incl = eur_wv_excl + eur_dividends
+                st.metric("W/V (excl. div)", f"€{eur_wv_excl:,.2f}",
+                         delta=f"{(eur_wv_excl/eur_invested*100):+.2f}%" if eur_invested > 0 else None)
+            with col5:
+                eur_wv_incl = eur_wv_excl + eur_dividends
+                st.metric("W/V (incl. div)", f"€{eur_wv_incl:,.2f}",
+                         delta=f"{(eur_wv_incl/eur_invested*100):+.2f}%" if eur_invested > 0 else None)
 
-        with col2:
-            st.metric("Huidige Waarde", f"€{total_current:,.2f}")
+            # USD sectie
+            st.markdown("### 💵 USD Portfolio")
+            col1, col2, col3, col4, col5 = st.columns(5)
 
-        with col3:
-            st.metric("Totaal Dividend", f"€{total_dividends:,.2f}")
+            with col1:
+                st.metric("Geïnvesteerd", f"${usd_invested:,.2f}")
+            with col2:
+                st.metric("Huidige Waarde", f"${usd_current:,.2f}")
+            with col3:
+                st.metric("Dividend", f"${usd_dividends:,.2f}")
+            with col4:
+                st.metric("W/V (excl. div)", f"${usd_wv_excl:,.2f}",
+                         delta=f"{(usd_wv_excl/usd_invested*100):+.2f}%" if usd_invested > 0 else None)
+            with col5:
+                usd_wv_incl = usd_wv_excl + usd_dividends
+                st.metric("W/V (incl. div)", f"${usd_wv_incl:,.2f}",
+                         delta=f"{(usd_wv_incl/usd_invested*100):+.2f}%" if usd_invested > 0 else None)
 
-        with col4:
-            st.metric(
-                "W/V (excl. div)",
-                f"€{total_gain_loss_excl:,.2f}",
-                delta=f"{(total_gain_loss_excl/total_invested*100):+.2f}%" if total_invested > 0 else None
-            )
+        else:
+            # Alleen EUR - oude weergave
+            total_invested = eur_invested
+            total_current = eur_current
+            total_wv_excl = eur_wv_excl
+            total_dividends = eur_dividends
+            total_gain_loss_incl = total_wv_excl + total_dividends
+            total_gain_loss_percent = (total_gain_loss_incl / total_invested * 100) if total_invested > 0 else 0
 
-        with col5:
-            st.metric(
-                "W/V (incl. div)",
-                f"€{total_gain_loss_incl:,.2f}",
+            col1, col2, col3, col4, col5 = st.columns(5)
+
+            with col1:
+                st.metric("Totaal Geinvesteerd", f"€{total_invested:,.2f}")
+
+            with col2:
+                st.metric("Huidige Waarde", f"€{total_current:,.2f}")
+
+            with col3:
+                st.metric("Totaal Dividend", f"€{total_dividends:,.2f}")
+
+            with col4:
+                st.metric(
+                    "W/V (excl. div)",
+                    f"€{total_wv_excl:,.2f}",
+                    delta=f"{(total_wv_excl/total_invested*100):+.2f}%" if total_invested > 0 else None
+                )
+
+            with col5:
+                st.metric(
+                    "W/V (incl. div)",
+                    f"€{total_gain_loss_incl:,.2f}",
                 delta=f"{total_gain_loss_percent:+.2f}%"
             )
 
@@ -1342,7 +1415,11 @@ else:
                 # Totaal check
                 total_from_table = sum([row['_perf']['current_value'] for row in portfolio_data if '_perf' in row and isinstance(row['_perf'], dict)])
                 st.write(f"**Som van alle aandelen:** €{total_from_table:.2f}")
-                st.write(f"**Getoonde Huidige Waarde:** €{total_current:.2f}")
+                if has_usd:
+                    st.write(f"**EUR Huidige Waarde:** €{eur_current:.2f}")
+                    st.write(f"**USD Huidige Waarde:** ${usd_current:.2f}")
+                else:
+                    st.write(f"**Getoonde Huidige Waarde:** €{total_current:.2f}")
 
         st.divider()
 
@@ -1439,14 +1516,17 @@ else:
             st.markdown(f"<small>{row['Aantal']}</small>", unsafe_allow_html=True)
 
         with col3:
+            # Gebruik display_symbol van de row (juiste currency voor USD accounts)
+            display_sym = row.get('_display_symbol', '€')
             if '_avg_price' in row:
-                st.markdown(f"<small>{currency_symbol}{row['_avg_price']:.2f}</small>", unsafe_allow_html=True)
+                st.markdown(f"<small>{display_sym}{row['_avg_price']:.2f}</small>", unsafe_allow_html=True)
             else:
                 st.markdown("<small>N/A</small>", unsafe_allow_html=True)
 
         with col4:
+            display_sym = row.get('_display_symbol', '€')
             if '_current_price' in row:
-                st.markdown(f"<small>{currency_symbol}{row['_current_price']:.2f}</small>", unsafe_allow_html=True)
+                st.markdown(f"<small>{display_sym}{row['_current_price']:.2f}</small>", unsafe_allow_html=True)
             else:
                 st.markdown("<small>N/A</small>", unsafe_allow_html=True)
 
@@ -1471,7 +1551,13 @@ else:
                 st.markdown("<small>N/A</small>", unsafe_allow_html=True)
 
         with col7:
-            st.markdown(f"<small>{row['Dividend (netto)']}</small>", unsafe_allow_html=True)
+            # Dividend met EUR equivalent voor USD
+            div_currency = row.get('_div_currency', 'EUR')
+            if div_currency == 'USD' and '_div_in_eur' in row:
+                div_in_eur = row['_div_in_eur']
+                st.markdown(f"<small>{row['Dividend (netto)']}</small><br><small>€{div_in_eur:.2f}</small>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<small>{row['Dividend (netto)']}</small>", unsafe_allow_html=True)
 
         with col8:
             st.markdown(f"<small>{row['Broker']}</small>", unsafe_allow_html=True)
